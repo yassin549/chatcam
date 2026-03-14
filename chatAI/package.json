@@ -1,4 +1,5 @@
 {
+<<<<<<< HEAD
   "name": "chatcam-analyzer",
   "version": "1.0.0",
   "description": "��#\u0000 \u0000c\u0000h\u0000a\u0000t\u0000c\u0000a\u0000m\u0000\r\u0000 \u0000",
@@ -6,6 +7,15 @@
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
     "start": "node analyzer.js",
+=======
+  "name": "chatcam",
+  "version": "1.0.0",
+  "description": "��#\u0000 \u0000c\u0000h\u0000a\u0000t\u0000c\u0000a\u0000m\u0000\r\u0000 \u0000",
+  "main": "server.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "node server.js",
+>>>>>>> 1b6a8fd075b7d24e7571f1640cd1eb525a9ba04d
     "analyze": "node analyzer.js"
   },
   "repository": {

@@ -125,6 +125,7 @@ npm run analyze
 - Send at least one message to the bot (`@chatcamAIbot`) so `getUpdates` can resolve your chat id.
 
 <<<<<<< HEAD
+<<<<<<< HEAD
 =======
 ## Analyzer (Render)
 This repo also includes a headless analyzer that connects to the WebRTC stream, samples ~1 fps, captions each sampled frame with Florence-2, stores new events in Postgres, and sends Telegram notifications.
@@ -152,6 +153,8 @@ npm run analyze
 - Send at least one message to the bot (`@chatcamAIbot`) so `getUpdates` can resolve your chat id.
 
 >>>>>>> 6c0dbc3 (added the LLM and chat option for telegram bot)
+=======
+>>>>>>> 1b6a8fd075b7d24e7571f1640cd1eb525a9ba04d
 ## Troubleshooting
 ### WebRTC viewer stuck on "Connecting..."
 - Ensure the server logs show FFmpeg is producing frames (look for `frame=` output).
