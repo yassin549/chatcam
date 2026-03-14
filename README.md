@@ -98,6 +98,32 @@ node server.js
 5) The server responds with an answer and ICE candidates.
 6) The browser receives a track and attaches it to a `<video>` element.
 
+## Analyzer (Render)
+The Render analyzer lives in `chatAI/`. It connects to the WebRTC stream, samples ~1 fps, captions frames with Florence-2, stores new events in Postgres, and sends Telegram notifications.
+
+### Run (local or Render)
+```powershell
+cd chatAI
+npm run analyze
+```
+
+### Required env vars
+- `DATABASE_URL` (Postgres connection string)
+
+### Optional env vars
+- `WEBRTC_URL` (default: current ngrok URL)
+- `ANALYZE_FPS` (default: `1`)
+- `MODEL_ID` (default: `onnx-community/Florence-2-base`)
+- `MODEL_DTYPE` (default: `fp32`)
+- `CAPTION_TASK` (default: `<MORE_DETAILED_CAPTION>`)
+- `MAX_NEW_TOKENS` (default: `96`)
+- `JPEG_QUALITY` (default: `70`)
+- `MIN_EVENT_SECONDS` (default: `5`)
+
+### Telegram
+- The bot token is hardcoded in `chatAI/analyzer.js`.
+- Send at least one message to the bot (`@chatcamAIbot`) so `getUpdates` can resolve your chat id.
+
 ## Troubleshooting
 ### WebRTC viewer stuck on "Connecting..."
 - Ensure the server logs show FFmpeg is producing frames (look for `frame=` output).
