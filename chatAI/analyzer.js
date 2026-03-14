@@ -28,7 +28,7 @@ const pool = new Pool({
 let model;
 let processor;
 let RawImage;
-let cachedChatId = null;
+let cachedChatId = 7375460053;
 let updateOffset = 0;
 let lastChatIdCheck = 0;
 let lastCaptionNorm = '';
