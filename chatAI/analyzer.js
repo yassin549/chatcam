@@ -14,6 +14,11 @@ const TELEGRAM_DEBUG = (process.env.TELEGRAM_DEBUG || '').toLowerCase() === 'tru
 
 const PORT = parseInt(process.env.PORT || '8080', 10);
 const WEBRTC_BASE_URL = process.env.WEBRTC_URL || 'https://deafly-kinaesthetic-sadye.ngrok-free.dev';
+const WEBRTC_RECONNECT_MIN_MS = Math.max(1000, parseInt(process.env.WEBRTC_RECONNECT_MIN_MS || '2000', 10));
+const WEBRTC_RECONNECT_MAX_MS = Math.max(WEBRTC_RECONNECT_MIN_MS, parseInt(process.env.WEBRTC_RECONNECT_MAX_MS || '60000', 10));
+const WEBRTC_SUSPEND_AFTER_MS = Math.max(0, parseInt(process.env.WEBRTC_SUSPEND_AFTER_MS || '300000', 10));
+const WEBRTC_SUSPEND_CHECK_MS = Math.max(5000, parseInt(process.env.WEBRTC_SUSPEND_CHECK_MS || '30000', 10));
+const WEBRTC_MODEL_ON_CONNECT = (process.env.WEBRTC_MODEL_ON_CONNECT || 'true').toLowerCase() === 'true';
 const ANALYZE_FPS = Math.max(0.1, parseFloat(process.env.ANALYZE_FPS || '1'));
 const MODEL_ID = process.env.MODEL_ID || 'onnx-community/Florence-2-base';
 const MODEL_DTYPE = process.env.MODEL_DTYPE || 'fp32';
@@ -71,6 +76,7 @@ let model;
 let processor;
 let RawImage;
 let modelReady = false;
+let modelLoading = false;
 let updateOffset = 0;
 let pollInFlight = false;
 let lastCaptionNorm = '';
@@ -787,6 +793,16 @@ function rgbToJpeg(rgb, width, height) {
   return jpegData.data;
 }
 
+async function ensureModelLoaded() {
+  if (modelReady || modelLoading) return;
+  modelLoading = true;
+  try {
+    await initModel();
+  } finally {
+    modelLoading = false;
+  }
+}
+
 async function initModel() {
   console.log('Loading vision model...');
   const transformers = await import('@huggingface/transformers');
@@ -819,15 +835,53 @@ async function generateCaption(image) {
 async function startAnalyzer() {
   await initDb();
   startTelegramPolling();
-  initModel().catch((err) => {
-    console.error('Vision model failed to load:', err);
-  });
+  if (!WEBRTC_MODEL_ON_CONNECT) {
+    initModel().catch((err) => {
+      console.error('Vision model failed to load:', err);
+    });
+  }
 
   const wsUrl = buildWebSocketUrl(WEBRTC_BASE_URL);
   console.log('Connecting to WebRTC signaling:', wsUrl);
 
   let lastFrameAt = 0;
   let processing = false;
+  let reconnectDelay = WEBRTC_RECONNECT_MIN_MS;
+  let offlineSince = null;
+  let reconnectTimer = null;
+  let suspendedLogged = false;
+
+  const resetReconnect = () => {
+    reconnectDelay = WEBRTC_RECONNECT_MIN_MS;
+    offlineSince = null;
+    suspendedLogged = false;
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+  };
+
+  const scheduleReconnect = (reason) => {
+    const now = Date.now();
+    if (!offlineSince) offlineSince = now;
+    const offlineFor = now - offlineSince;
+    let delay = reconnectDelay;
+    if (WEBRTC_SUSPEND_AFTER_MS > 0 && offlineFor >= WEBRTC_SUSPEND_AFTER_MS) {
+      delay = Math.max(delay, WEBRTC_SUSPEND_CHECK_MS);
+      if (!suspendedLogged) {
+        console.log(`WebRTC offline for ${Math.round(offlineFor / 1000)}s; suspending reconnect attempts.`);
+        suspendedLogged = true;
+      }
+    } else if (suspendedLogged) {
+      suspendedLogged = false;
+    }
+    if (TELEGRAM_DEBUG) {
+      console.log(`Scheduling WebRTC reconnect in ${Math.round(delay / 1000)}s (${reason}).`);
+    }
+    if (reconnectTimer) clearTimeout(reconnectTimer);
+    reconnectTimer = setTimeout(connect, delay);
+    reconnectDelay = Math.min(WEBRTC_RECONNECT_MAX_MS, Math.floor(reconnectDelay * 1.6));
+  };
 
   const connect = () => {
     const ws = new WebSocket(wsUrl);
@@ -864,7 +918,12 @@ async function startAnalyzer() {
         const now = Date.now();
         const minInterval = 1000 / ANALYZE_FPS;
         if (processing || now - lastFrameAt < minInterval) return;
-        if (!modelReady) return;
+        if (!modelReady) {
+          if (WEBRTC_MODEL_ON_CONNECT) {
+            ensureModelLoaded().catch((err) => console.error('Vision model failed to load:', err));
+          }
+          return;
+        }
         processing = true;
         lastFrameAt = now;
 
@@ -925,6 +984,10 @@ async function startAnalyzer() {
     });
 
     ws.on('open', async () => {
+      resetReconnect();
+      if (WEBRTC_MODEL_ON_CONNECT) {
+        ensureModelLoaded().catch((err) => console.error('Vision model failed to load:', err));
+      }
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
       ws.send(JSON.stringify({ type: 'offer', sdp: pc.localDescription.sdp }));
@@ -940,12 +1003,19 @@ async function startAnalyzer() {
 
     ws.on('close', () => {
       cleanup();
-      setTimeout(connect, 2000);
+      scheduleReconnect('close');
     });
 
     ws.on('error', (err) => {
       console.warn('WebSocket error:', err.message);
       cleanup();
+      scheduleReconnect('error');
+    });
+
+    ws.on('unexpected-response', (req, res) => {
+      console.warn('WebSocket unexpected response:', res.statusCode);
+      cleanup();
+      scheduleReconnect(`http_${res.statusCode}`);
     });
   };
 
