@@ -161,6 +161,12 @@ function truncateTelegramText(text) {
   return `${text.slice(0, 3900)}...`;
 }
 
+function truncateTelegramCaption(text) {
+  if (!text) return '';
+  if (text.length <= 1000) return text;
+  return `${text.slice(0, 1000)}...`;
+}
+
 function buildEventContext(events, windowHours, note) {
   const lines = [];
   lines.push(`Event context window: last ${windowHours} hour(s).`);
@@ -214,6 +220,21 @@ async function searchEvents(tokens, windowHours, limit) {
 async function getEventById(id) {
   const res = await pool.query('SELECT id, created_at, caption FROM events WHERE id = $1', [id]);
   return res.rows[0] || null;
+}
+
+async function getEventByIdWithImage(id) {
+  const res = await pool.query('SELECT id, created_at, caption, image FROM events WHERE id = $1', [id]);
+  return res.rows[0] || null;
+}
+
+async function getLatestEventWithImage() {
+  const res = await pool.query('SELECT id, created_at, caption, image FROM events ORDER BY created_at DESC LIMIT 1');
+  return res.rows[0] || null;
+}
+
+async function getEventStats() {
+  const res = await pool.query('SELECT COUNT(*)::int AS count, MAX(created_at) AS latest FROM events');
+  return res.rows[0] || { count: 0, latest: null };
 }
 
 async function clearTelegramWebhook() {
@@ -425,6 +446,52 @@ async function sendTelegramMessage(text, options = {}) {
   }
 }
 
+async function sendTelegramPhoto(imageBuffer, options = {}) {
+  if (!TELEGRAM_BOT_TOKEN) return;
+  if (!imageBuffer) {
+    await sendTelegramMessage('No image available to send.', options);
+    return;
+  }
+  const targetIds = [];
+  if (options.chatId) {
+    targetIds.push(String(options.chatId));
+  } else if (TELEGRAM_CHAT_ID) {
+    targetIds.push(String(TELEGRAM_CHAT_ID));
+  } else {
+    targetIds.push(...Array.from(knownChatIds));
+  }
+  if (!targetIds.length) {
+    console.warn('No Telegram chat id available. Send a message to the bot first.');
+    return;
+  }
+
+  const caption = truncateTelegramCaption(options.caption || '');
+  for (const chatId of targetIds) {
+    const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendPhoto`;
+    const form = new FormData();
+    form.append('chat_id', String(chatId));
+    if (caption) {
+      form.append('caption', caption);
+    }
+    if (options.replyToMessageId) {
+      form.append('reply_to_message_id', String(options.replyToMessageId));
+    }
+    try {
+      const blob = new Blob([imageBuffer], { type: 'image/jpeg' });
+      form.append('photo', blob, 'event.jpg');
+      const res = await fetch(url, { method: 'POST', body: form });
+      if (!res.ok) {
+        const respBody = await res.text().catch(() => '');
+        console.warn('Telegram sendPhoto failed:', res.status, respBody);
+      }
+    } catch (err) {
+      const cause = err && err.cause ? err.cause : null;
+      const extra = cause && cause.code ? ` code=${cause.code}` : '';
+      console.warn(`Telegram sendPhoto fetch failed:${extra}`, err.message || err);
+    }
+  }
+}
+
 async function answerChatQuestion(chatId, text) {
   if (!isLlmConfigured()) {
     return getLlmConfigMessage();
@@ -470,6 +537,46 @@ async function answerChatQuestion(chatId, text) {
   return reply || 'I could not generate a response.';
 }
 
+function isPhotoRequest(text) {
+  if (/^\/(photo|picture|image|snapshot|lastphoto)\b/i.test(text)) return true;
+  return /\b(last|latest)\b.*\b(photo|picture|image|snapshot)\b/i.test(text)
+    || /\b(send|show|share)\b.*\b(photo|picture|image|snapshot)\b/i.test(text);
+}
+
+function isDatabaseStatusRequest(text) {
+  return /\b(database|db)\b.*\bempty\b/i.test(text)
+    || /\bany\b.*\bevents\b/i.test(text)
+    || /\bevents?\s+recorded\b/i.test(text);
+}
+
+async function handlePhotoRequest(chatId, text, messageId) {
+  const eventId = extractEventId(text);
+  const event = eventId ? await getEventByIdWithImage(eventId) : await getLatestEventWithImage();
+  if (!event) {
+    const message = eventId
+      ? `No event found for id ${eventId}.`
+      : 'No events recorded yet, so there is no photo to send.';
+    await sendTelegramMessage(message, { chatId, replyToMessageId: messageId });
+    return;
+  }
+  const ts = new Date(event.created_at).toISOString();
+  const caption = `Event #${event.id} at ${ts}\n${event.caption}`;
+  await sendTelegramPhoto(event.image, { chatId, replyToMessageId: messageId, caption });
+}
+
+async function handleDatabaseStatusRequest(chatId, messageId) {
+  const stats = await getEventStats();
+  if (!stats || !stats.count) {
+    await sendTelegramMessage('Yes. The database has no events yet.', { chatId, replyToMessageId: messageId });
+    return;
+  }
+  const ts = stats.latest ? new Date(stats.latest).toISOString() : 'unknown time';
+  await sendTelegramMessage(
+    `No. The database has ${stats.count} event(s). Latest event at ${ts}.`,
+    { chatId, replyToMessageId: messageId }
+  );
+}
+
 async function handleTelegramText(chatId, text, messageId) {
   const trimmed = (text || '').trim();
   if (!trimmed) return;
@@ -481,13 +588,23 @@ async function handleTelegramText(chatId, text, messageId) {
       'Examples:',
       '- "summary of the last 2 hours"',
       '- "did someone enter the garage today?"',
-      '- "explain event #42"'
+      '- "explain event #42"',
+      '- "send the last photo"',
+      '- "is the database empty?"'
     ].join('\n');
     await sendTelegramMessage(help, { chatId, replyToMessageId: messageId });
     return;
   }
 
   try {
+    if (isPhotoRequest(trimmed)) {
+      await handlePhotoRequest(chatId, trimmed, messageId);
+      return;
+    }
+    if (isDatabaseStatusRequest(trimmed)) {
+      await handleDatabaseStatusRequest(chatId, messageId);
+      return;
+    }
     const reply = await answerChatQuestion(chatId, trimmed);
     await sendTelegramMessage(reply, { chatId, replyToMessageId: messageId });
   } catch (err) {
