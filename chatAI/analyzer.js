@@ -25,9 +25,11 @@ const CHAT_EVENT_LIMIT = Math.max(1, parseInt(process.env.CHAT_EVENT_LIMIT || '2
 const CHAT_EVENT_WINDOW_HOURS = Math.max(1, parseFloat(process.env.CHAT_EVENT_WINDOW_HOURS || '24'));
 
 const LLM_BACKEND = (process.env.LLM_BACKEND || 'disabled').toLowerCase();
-const LLM_MODEL = process.env.LLM_MODEL || 'gpt-4o-mini';
+const LLM_MODEL = process.env.LLM_MODEL || (LLM_BACKEND === 'gemini' ? 'gemini-2.0-flash' : 'gpt-4o-mini');
 const LLM_API_KEY = process.env.LLM_API_KEY || process.env.OPENAI_API_KEY || '';
 const LLM_BASE_URL = process.env.LLM_BASE_URL || process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1';
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || process.env.LLM_API_KEY || '';
+const GEMINI_BASE_URL = process.env.GEMINI_BASE_URL || 'https://generativelanguage.googleapis.com/v1beta';
 const LLM_TEMPERATURE = Math.min(1, Math.max(0, parseFloat(process.env.LLM_TEMPERATURE || '0.2')));
 const LLM_MAX_TOKENS = Math.max(64, parseInt(process.env.LLM_MAX_TOKENS || '400', 10));
 const LLM_TIMEOUT_MS = Math.max(5000, parseInt(process.env.LLM_TIMEOUT_MS || '30000', 10));
@@ -214,10 +216,22 @@ function isLlmConfigured() {
   if (LLM_BACKEND === 'openai_compat') {
     return Boolean(LLM_API_KEY && LLM_BASE_URL);
   }
+  if (LLM_BACKEND === 'gemini') {
+    return Boolean(GEMINI_API_KEY);
+  }
   return false;
 }
 
 function getLlmConfigMessage() {
+  if (LLM_BACKEND === 'gemini') {
+    return [
+      'LLM is not configured. Set these environment variables on Render:',
+      '- LLM_BACKEND=gemini',
+      '- GEMINI_API_KEY=your_api_key',
+      '- LLM_MODEL=gemini-2.0-flash (or another Gemini model)'
+    ].join('\n');
+  }
+
   return [
     'LLM is not configured. Set these environment variables on Render:',
     '- LLM_BACKEND=openai_compat',
@@ -261,9 +275,75 @@ async function callOpenAiCompat(messages) {
   }
 }
 
+function buildGeminiSystemInstruction(messages) {
+  const systemText = messages
+    .filter((msg) => msg && msg.role === 'system' && msg.content)
+    .map((msg) => String(msg.content))
+    .join('\n\n')
+    .trim();
+  if (!systemText) return null;
+  return { parts: [{ text: systemText }] };
+}
+
+function buildGeminiContents(messages) {
+  const contents = [];
+  for (const msg of messages) {
+    if (!msg || !msg.content || msg.role === 'system') continue;
+    const role = msg.role === 'assistant' ? 'model' : 'user';
+    contents.push({ role, parts: [{ text: String(msg.content) }] });
+  }
+  return contents;
+}
+
+async function callGemini(messages) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), LLM_TIMEOUT_MS);
+  try {
+    const base = GEMINI_BASE_URL.replace(/\/$/, '');
+    const url = `${base}/models/${encodeURIComponent(LLM_MODEL)}:generateContent`;
+    const systemInstruction = buildGeminiSystemInstruction(messages);
+    const contents = buildGeminiContents(messages);
+    const body = {
+      contents,
+      generationConfig: {
+        temperature: LLM_TEMPERATURE,
+        maxOutputTokens: LLM_MAX_TOKENS
+      }
+    };
+    if (systemInstruction) {
+      body.systemInstruction = systemInstruction;
+    }
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-goog-api-key': GEMINI_API_KEY
+      },
+      body: JSON.stringify(body),
+      signal: controller.signal
+    });
+    const data = await res.json().catch(() => null);
+    if (!res.ok) {
+      const errorMessage = data && data.error ? JSON.stringify(data.error) : res.statusText;
+      throw new Error(`Gemini request failed: ${res.status} ${errorMessage}`);
+    }
+    const candidate = data && Array.isArray(data.candidates) ? data.candidates[0] : null;
+    const parts = candidate && candidate.content && Array.isArray(candidate.content.parts)
+      ? candidate.content.parts
+      : [];
+    const text = parts.map((part) => part && part.text ? part.text : '').join('').trim();
+    return text;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 async function callLlm(messages) {
   if (LLM_BACKEND === 'openai_compat') {
     return callOpenAiCompat(messages);
+  }
+  if (LLM_BACKEND === 'gemini') {
+    return callGemini(messages);
   }
   throw new Error(`Unsupported LLM_BACKEND: ${LLM_BACKEND}`);
 }
