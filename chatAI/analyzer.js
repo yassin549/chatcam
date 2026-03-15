@@ -7,6 +7,8 @@ const jpeg = require('jpeg-js');
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
 const TELEGRAM_POLL_MS = Math.max(1000, parseInt(process.env.TELEGRAM_POLL_MS || '1500', 10));
+const TELEGRAM_CLEAR_WEBHOOK = (process.env.TELEGRAM_CLEAR_WEBHOOK || 'true').toLowerCase() === 'true';
+const TELEGRAM_DEBUG = (process.env.TELEGRAM_DEBUG || '').toLowerCase() === 'true';
 
 const PORT = parseInt(process.env.PORT || '8080', 10);
 const WEBRTC_BASE_URL = process.env.WEBRTC_URL || 'https://deafly-kinaesthetic-sadye.ngrok-free.dev';
@@ -42,6 +44,7 @@ const pool = new Pool({
 let model;
 let processor;
 let RawImage;
+let modelReady = false;
 let updateOffset = 0;
 let pollInFlight = false;
 let lastCaptionNorm = '';
@@ -187,6 +190,23 @@ async function searchEvents(tokens, windowHours, limit) {
 async function getEventById(id) {
   const res = await pool.query('SELECT id, created_at, caption FROM events WHERE id = $1', [id]);
   return res.rows[0] || null;
+}
+
+async function clearTelegramWebhook() {
+  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CLEAR_WEBHOOK) return;
+  try {
+    const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/deleteWebhook?drop_pending_updates=true`;
+    const res = await fetch(url);
+    if (!res.ok) {
+      console.warn('Telegram deleteWebhook failed:', res.status);
+      return;
+    }
+    if (TELEGRAM_DEBUG) {
+      console.log('Telegram webhook cleared.');
+    }
+  } catch (err) {
+    console.warn('Telegram deleteWebhook error:', err.message || err);
+  }
 }
 
 function isLlmConfigured() {
@@ -377,6 +397,9 @@ async function pollTelegramUpdates() {
       console.warn('Telegram getUpdates error:', data);
       return;
     }
+    if (TELEGRAM_DEBUG && data.result.length) {
+      console.log(`Telegram updates received: ${data.result.length}`);
+    }
 
     for (const update of data.result) {
       updateOffset = Math.max(updateOffset, (update.update_id || 0) + 1);
@@ -399,6 +422,7 @@ function startTelegramPolling() {
     console.warn('TELEGRAM_BOT_TOKEN is not set. Telegram bot is disabled.');
     return;
   }
+  clearTelegramWebhook().catch((err) => console.warn('Telegram deleteWebhook failed:', err));
   setInterval(() => {
     pollTelegramUpdates().catch((err) => console.warn('Telegram polling failed:', err));
   }, TELEGRAM_POLL_MS);
@@ -459,11 +483,14 @@ function rgbToJpeg(rgb, width, height) {
 }
 
 async function initModel() {
+  console.log('Loading vision model...');
   const transformers = await import('@huggingface/transformers');
   const { Florence2ForConditionalGeneration, AutoProcessor: HFProcessor, RawImage: HFImage } = transformers;
   RawImage = HFImage;
   processor = await HFProcessor.from_pretrained(MODEL_ID);
   model = await Florence2ForConditionalGeneration.from_pretrained(MODEL_ID, { dtype: MODEL_DTYPE });
+  modelReady = true;
+  console.log('Vision model ready.');
 }
 
 async function generateCaption(image) {
@@ -486,8 +513,10 @@ async function generateCaption(image) {
 
 async function startAnalyzer() {
   await initDb();
-  await initModel();
   startTelegramPolling();
+  initModel().catch((err) => {
+    console.error('Vision model failed to load:', err);
+  });
 
   const wsUrl = buildWebSocketUrl(WEBRTC_BASE_URL);
   console.log('Connecting to WebRTC signaling:', wsUrl);
@@ -530,6 +559,7 @@ async function startAnalyzer() {
         const now = Date.now();
         const minInterval = 1000 / ANALYZE_FPS;
         if (processing || now - lastFrameAt < minInterval) return;
+        if (!modelReady) return;
         processing = true;
         lastFrameAt = now;
 
