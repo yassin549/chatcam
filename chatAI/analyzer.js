@@ -25,9 +25,19 @@ const CHAT_EVENT_LIMIT = Math.max(1, parseInt(process.env.CHAT_EVENT_LIMIT || '2
 const CHAT_EVENT_WINDOW_HOURS = Math.max(1, parseFloat(process.env.CHAT_EVENT_WINDOW_HOURS || '24'));
 
 const LLM_BACKEND = (process.env.LLM_BACKEND || 'disabled').toLowerCase();
-const LLM_MODEL = process.env.LLM_MODEL || (LLM_BACKEND === 'gemini' ? 'gemini-2.0-flash' : 'gpt-4o-mini');
-const LLM_API_KEY = process.env.LLM_API_KEY || process.env.OPENAI_API_KEY || '';
-const LLM_BASE_URL = process.env.LLM_BASE_URL || process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1';
+const DEFAULT_OPENAI_MODEL = 'gpt-4o-mini';
+const DEFAULT_GROQ_MODEL = 'llama-3.1-8b-instant';
+const DEFAULT_GEMINI_MODEL = 'gemini-2.0-flash';
+const GROQ_API_KEY = process.env.GROQ_API_KEY || '';
+const LLM_MODEL = process.env.LLM_MODEL
+  || (LLM_BACKEND === 'gemini' ? DEFAULT_GEMINI_MODEL : (GROQ_API_KEY ? DEFAULT_GROQ_MODEL : DEFAULT_OPENAI_MODEL));
+const LLM_API_KEY = process.env.LLM_API_KEY || process.env.OPENAI_API_KEY || GROQ_API_KEY || '';
+const DEFAULT_OPENAI_BASE = 'https://api.openai.com/v1';
+const DEFAULT_GROQ_BASE = 'https://api.groq.com/openai/v1';
+const LLM_BASE_URL = process.env.LLM_BASE_URL
+  || process.env.OPENAI_BASE_URL
+  || process.env.GROQ_BASE_URL
+  || (GROQ_API_KEY ? DEFAULT_GROQ_BASE : DEFAULT_OPENAI_BASE);
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || process.env.LLM_API_KEY || '';
 const GEMINI_BASE_URL = process.env.GEMINI_BASE_URL || 'https://generativelanguage.googleapis.com/v1beta';
 const LLM_TEMPERATURE = Math.min(1, Math.max(0, parseFloat(process.env.LLM_TEMPERATURE || '0.2')));
@@ -228,16 +238,16 @@ function getLlmConfigMessage() {
       'LLM is not configured. Set these environment variables on Render:',
       '- LLM_BACKEND=gemini',
       '- GEMINI_API_KEY=your_api_key',
-      '- LLM_MODEL=gemini-2.0-flash (or another Gemini model)'
+      `- LLM_MODEL=${DEFAULT_GEMINI_MODEL} (or another Gemini model)`
     ].join('\n');
   }
 
   return [
     'LLM is not configured. Set these environment variables on Render:',
     '- LLM_BACKEND=openai_compat',
-    '- LLM_API_KEY=your_api_key',
-    '- LLM_MODEL=your_model_name',
-    '- LLM_BASE_URL=https://api.openai.com/v1 (or your OpenAI-compatible endpoint)'
+    '- LLM_API_KEY=your_api_key (or GROQ_API_KEY)',
+    `- LLM_MODEL=${DEFAULT_OPENAI_MODEL} (or ${DEFAULT_GROQ_MODEL} on Groq)`,
+    `- LLM_BASE_URL=${DEFAULT_OPENAI_BASE} (or ${DEFAULT_GROQ_BASE} for Groq)`
   ].join('\n');
 }
 
@@ -266,9 +276,15 @@ async function callOpenAiCompat(messages) {
       throw new Error(`LLM request failed: ${res.status} ${errorMessage}`);
     }
     const choice = data && data.choices ? data.choices[0] : null;
-    const content = choice && choice.message && choice.message.content
-      ? choice.message.content
-      : (choice && choice.text ? choice.text : '');
+    const message = choice && choice.message ? choice.message : null;
+    let content = '';
+    if (message && typeof message.content === 'string') {
+      content = message.content;
+    } else if (message && Array.isArray(message.content)) {
+      content = message.content.map((part) => (part && part.text ? part.text : '')).join('');
+    } else if (choice && typeof choice.text === 'string') {
+      content = choice.text;
+    }
     return String(content || '').trim();
   } finally {
     clearTimeout(timeout);
