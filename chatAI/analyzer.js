@@ -1,4 +1,5 @@
 const http = require('http');
+const dns = require('dns');
 const WebSocket = require('ws');
 const wrtc = require('wrtc');
 const { Pool } = require('pg');
@@ -7,6 +8,7 @@ const jpeg = require('jpeg-js');
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
 const TELEGRAM_POLL_MS = Math.max(1000, parseInt(process.env.TELEGRAM_POLL_MS || '1500', 10));
+const TELEGRAM_LONG_POLL_SECONDS = Math.max(0, parseInt(process.env.TELEGRAM_LONG_POLL_SECONDS || '25', 10));
 const TELEGRAM_CLEAR_WEBHOOK = (process.env.TELEGRAM_CLEAR_WEBHOOK || 'true').toLowerCase() === 'true';
 const TELEGRAM_DEBUG = (process.env.TELEGRAM_DEBUG || '').toLowerCase() === 'true';
 
@@ -43,6 +45,16 @@ const GEMINI_BASE_URL = process.env.GEMINI_BASE_URL || 'https://generativelangua
 const LLM_TEMPERATURE = Math.min(1, Math.max(0, parseFloat(process.env.LLM_TEMPERATURE || '0.2')));
 const LLM_MAX_TOKENS = Math.max(64, parseInt(process.env.LLM_MAX_TOKENS || '400', 10));
 const LLM_TIMEOUT_MS = Math.max(5000, parseInt(process.env.LLM_TIMEOUT_MS || '30000', 10));
+
+if ((process.env.DNS_IPV4_FIRST || 'true').toLowerCase() === 'true') {
+  try {
+    if (typeof dns.setDefaultResultOrder === 'function') {
+      dns.setDefaultResultOrder('ipv4first');
+    }
+  } catch (err) {
+    console.warn('DNS result order not set:', err.message || err);
+  }
+}
 
 if (!process.env.DATABASE_URL) {
   console.error('DATABASE_URL is required.');
@@ -493,7 +505,7 @@ async function pollTelegramUpdates() {
   try {
     const params = new URLSearchParams({
       offset: String(updateOffset),
-      timeout: '0',
+      timeout: String(TELEGRAM_LONG_POLL_SECONDS),
       allowed_updates: JSON.stringify(['message', 'edited_message', 'channel_post', 'edited_channel_post'])
     });
     const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates?${params.toString()}`;
