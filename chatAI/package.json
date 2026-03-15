@@ -1,7 +1,7 @@
-﻿{
+{
   "name": "chatcam-analyzer",
   "version": "1.0.0",
-  "description": "ï¿½ï¿½#\u0000 \u0000c\u0000h\u0000a\u0000t\u0000c\u0000a\u0000m\u0000\r\u0000 \u0000",
+  "description": "chatcam analyzer",
   "main": "analyzer.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",

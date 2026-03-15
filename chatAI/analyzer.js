@@ -1,10 +1,12 @@
-﻿const http = require('http');
+const http = require('http');
 const WebSocket = require('ws');
 const wrtc = require('wrtc');
 const { Pool } = require('pg');
 const jpeg = require('jpeg-js');
 
-const TELEGRAM_BOT_TOKEN = '8715068728:AAEEcvxrXlhHC2WBQd62OrYgqU3G_mM8zn0';
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
+const TELEGRAM_POLL_MS = Math.max(1000, parseInt(process.env.TELEGRAM_POLL_MS || '1500', 10));
 
 const PORT = parseInt(process.env.PORT || '8080', 10);
 const WEBRTC_BASE_URL = process.env.WEBRTC_URL || 'https://deafly-kinaesthetic-sadye.ngrok-free.dev';
@@ -15,6 +17,18 @@ const CAPTION_TASK = process.env.CAPTION_TASK || '<MORE_DETAILED_CAPTION>';
 const MAX_NEW_TOKENS = parseInt(process.env.MAX_NEW_TOKENS || '96', 10);
 const JPEG_QUALITY = Math.min(95, Math.max(40, parseInt(process.env.JPEG_QUALITY || '70', 10)));
 const MIN_EVENT_SECONDS = Math.max(0, parseFloat(process.env.MIN_EVENT_SECONDS || '5'));
+
+const CHAT_HISTORY_LIMIT = Math.max(2, parseInt(process.env.CHAT_HISTORY_LIMIT || '8', 10));
+const CHAT_EVENT_LIMIT = Math.max(1, parseInt(process.env.CHAT_EVENT_LIMIT || '20', 10));
+const CHAT_EVENT_WINDOW_HOURS = Math.max(1, parseFloat(process.env.CHAT_EVENT_WINDOW_HOURS || '24'));
+
+const LLM_BACKEND = (process.env.LLM_BACKEND || 'disabled').toLowerCase();
+const LLM_MODEL = process.env.LLM_MODEL || 'gpt-4o-mini';
+const LLM_API_KEY = process.env.LLM_API_KEY || process.env.OPENAI_API_KEY || '';
+const LLM_BASE_URL = process.env.LLM_BASE_URL || process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1';
+const LLM_TEMPERATURE = Math.min(1, Math.max(0, parseFloat(process.env.LLM_TEMPERATURE || '0.2')));
+const LLM_MAX_TOKENS = Math.max(64, parseInt(process.env.LLM_MAX_TOKENS || '400', 10));
+const LLM_TIMEOUT_MS = Math.max(5000, parseInt(process.env.LLM_TIMEOUT_MS || '30000', 10));
 
 if (!process.env.DATABASE_URL) {
   console.error('DATABASE_URL is required.');
@@ -28,11 +42,32 @@ const pool = new Pool({
 let model;
 let processor;
 let RawImage;
-let cachedChatId = 7375460053;
 let updateOffset = 0;
-let lastChatIdCheck = 0;
+let pollInFlight = false;
 let lastCaptionNorm = '';
 let lastEventAt = 0;
+
+const knownChatIds = new Set();
+const chatHistory = new Map();
+
+const STOPWORDS = new Set([
+  'the', 'a', 'an', 'and', 'or', 'but', 'if', 'then', 'so', 'to', 'of', 'in', 'on', 'at',
+  'for', 'with', 'without', 'about', 'from', 'into', 'over', 'after', 'before', 'is',
+  'are', 'was', 'were', 'be', 'been', 'being', 'it', 'this', 'that', 'these', 'those',
+  'what', 'when', 'where', 'who', 'why', 'how', 'did', 'does', 'do', 'has', 'have', 'had',
+  'any', 'some', 'someone', 'something', 'anything', 'there', 'please', 'show', 'tell',
+  'me', 'my', 'we', 'us', 'you', 'your', 'i'
+]);
+
+const SYSTEM_PROMPT = [
+  'You are ChatCam, a camera event manager.',
+  'Answer questions using ONLY the event context provided.',
+  'If the context is empty or insufficient, say so and ask a clarifying question.',
+  'If asked whether something happened, answer yes or no based on events and cite event ids and timestamps.',
+  'If asked for a summary, provide a concise summary and highlight notable events.',
+  'If asked to explain an event, explain based on the caption and context only.',
+  'Do not invent events or details that are not in the context.'
+].join(' ');
 
 function normalizeCaption(text) {
   return text
@@ -51,6 +86,70 @@ function buildWebSocketUrl(baseUrl) {
   return url.toString();
 }
 
+function addChatHistory(chatId, role, content) {
+  const key = String(chatId);
+  const history = chatHistory.get(key) || [];
+  history.push({ role, content });
+  while (history.length > CHAT_HISTORY_LIMIT * 2) {
+    history.shift();
+  }
+  chatHistory.set(key, history);
+}
+
+function getChatHistory(chatId) {
+  const history = chatHistory.get(String(chatId)) || [];
+  return history.slice(-CHAT_HISTORY_LIMIT * 2);
+}
+
+function parseTimeWindowHours(text) {
+  const match = text.toLowerCase().match(/(?:last|past)\s+(\d+(?:\.\d+)?)\s*(minute|minutes|hour|hours|day|days)/);
+  if (!match) return null;
+  const value = parseFloat(match[1]);
+  const unit = match[2];
+  if (unit.startsWith('minute')) return value / 60;
+  if (unit.startsWith('hour')) return value;
+  if (unit.startsWith('day')) return value * 24;
+  return null;
+}
+
+function extractEventId(text) {
+  const match = text.match(/(?:event\s*#?|#)(\d{1,9})/i);
+  if (!match) return null;
+  const id = parseInt(match[1], 10);
+  return Number.isFinite(id) ? id : null;
+}
+
+function isSummaryRequest(text) {
+  return /\bsummary\b|\bsummarize\b|\brecap\b|\boverview\b|what\s+happened/i.test(text);
+}
+
+function extractSearchTokens(text) {
+  const cleaned = text.toLowerCase().replace(/[^a-z0-9\s]/g, ' ');
+  const tokens = cleaned.split(/\s+/).filter((token) => token && !STOPWORDS.has(token));
+  return tokens.slice(0, 8);
+}
+
+function truncateTelegramText(text) {
+  if (text.length <= 3900) return text;
+  return `${text.slice(0, 3900)}...`;
+}
+
+function buildEventContext(events, windowHours, note) {
+  const lines = [];
+  lines.push(`Event context window: last ${windowHours} hour(s).`);
+  if (note) lines.push(`Note: ${note}`);
+  if (!events.length) {
+    lines.push('No events found in this window.');
+    return lines.join('\n');
+  }
+  lines.push('Events (newest first):');
+  for (const event of events) {
+    const ts = new Date(event.created_at).toISOString();
+    lines.push(`- [id=${event.id} | ${ts}] ${event.caption}`);
+  }
+  return lines.join('\n');
+}
+
 async function initDb() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS events (
@@ -62,53 +161,248 @@ async function initDb() {
   `);
 }
 
-async function fetchChatId() {
-  if (cachedChatId) return cachedChatId;
-  const now = Date.now();
-  if (now - lastChatIdCheck < 3000) return null;
-  lastChatIdCheck = now;
-
-  const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates?offset=${updateOffset}`;
-  const res = await fetch(url);
-  if (!res.ok) {
-    console.warn('Telegram getUpdates failed:', res.status);
-    return null;
-  }
-  const data = await res.json();
-  if (!data.ok) {
-    console.warn('Telegram getUpdates error:', data);
-    return null;
-  }
-  if (Array.isArray(data.result) && data.result.length > 0) {
-    for (const update of data.result) {
-      updateOffset = Math.max(updateOffset, (update.update_id || 0) + 1);
-      const msg = update.message || update.channel_post || update.edited_message || update.edited_channel_post;
-      if (msg && msg.chat && typeof msg.chat.id === 'number') {
-        cachedChatId = msg.chat.id;
-        console.log('Resolved Telegram chat id:', cachedChatId);
-        return cachedChatId;
-      }
-    }
-  }
-  return null;
+async function getRecentEvents(windowHours, limit) {
+  const res = await pool.query(
+    'SELECT id, created_at, caption FROM events WHERE created_at >= NOW() - ($1 * INTERVAL \'1 hour\') ORDER BY created_at DESC LIMIT $2',
+    [windowHours, limit]
+  );
+  return res.rows;
 }
 
-async function sendTelegramMessage(text) {
-  const chatId = await fetchChatId();
-  if (!chatId) {
-    console.warn('Telegram chat id not available yet. Send a message to the bot.');
+async function searchEvents(tokens, windowHours, limit) {
+  if (!tokens.length) return getRecentEvents(windowHours, limit);
+  const params = [windowHours];
+  const conditions = [];
+  for (const token of tokens) {
+    params.push(`%${token}%`);
+    conditions.push(`caption ILIKE $${params.length}`);
+  }
+  params.push(limit);
+  const where = conditions.length ? `AND (${conditions.join(' OR ')})` : '';
+  const sql = `SELECT id, created_at, caption FROM events WHERE created_at >= NOW() - ($1 * INTERVAL '1 hour') ${where} ORDER BY created_at DESC LIMIT $${params.length}`;
+  const res = await pool.query(sql, params);
+  return res.rows;
+}
+
+async function getEventById(id) {
+  const res = await pool.query('SELECT id, created_at, caption FROM events WHERE id = $1', [id]);
+  return res.rows[0] || null;
+}
+
+function isLlmConfigured() {
+  if (LLM_BACKEND === 'disabled') return false;
+  if (LLM_BACKEND === 'openai_compat') {
+    return Boolean(LLM_API_KEY && LLM_BASE_URL);
+  }
+  return false;
+}
+
+function getLlmConfigMessage() {
+  return [
+    'LLM is not configured. Set these environment variables on Render:',
+    '- LLM_BACKEND=openai_compat',
+    '- LLM_API_KEY=your_api_key',
+    '- LLM_MODEL=your_model_name',
+    '- LLM_BASE_URL=https://api.openai.com/v1 (or your OpenAI-compatible endpoint)'
+  ].join('\n');
+}
+
+async function callOpenAiCompat(messages) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), LLM_TIMEOUT_MS);
+  try {
+    const url = `${LLM_BASE_URL.replace(/\/$/, '')}/chat/completions`;
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${LLM_API_KEY}`
+      },
+      body: JSON.stringify({
+        model: LLM_MODEL,
+        temperature: LLM_TEMPERATURE,
+        max_tokens: LLM_MAX_TOKENS,
+        messages
+      }),
+      signal: controller.signal
+    });
+    const data = await res.json().catch(() => null);
+    if (!res.ok) {
+      const errorMessage = data && data.error ? JSON.stringify(data.error) : res.statusText;
+      throw new Error(`LLM request failed: ${res.status} ${errorMessage}`);
+    }
+    const choice = data && data.choices ? data.choices[0] : null;
+    const content = choice && choice.message && choice.message.content
+      ? choice.message.content
+      : (choice && choice.text ? choice.text : '');
+    return String(content || '').trim();
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function callLlm(messages) {
+  if (LLM_BACKEND === 'openai_compat') {
+    return callOpenAiCompat(messages);
+  }
+  throw new Error(`Unsupported LLM_BACKEND: ${LLM_BACKEND}`);
+}
+
+async function handleEvent(caption, jpegBuffer) {
+  await pool.query('INSERT INTO events (caption, image) VALUES ($1, $2)', [caption, jpegBuffer]);
+  await sendTelegramMessage(caption);
+}
+
+async function sendTelegramMessage(text, options = {}) {
+  if (!TELEGRAM_BOT_TOKEN) return;
+  const payloadText = truncateTelegramText(text);
+  const targetIds = [];
+  if (options.chatId) {
+    targetIds.push(String(options.chatId));
+  } else if (TELEGRAM_CHAT_ID) {
+    targetIds.push(String(TELEGRAM_CHAT_ID));
+  } else {
+    targetIds.push(...Array.from(knownChatIds));
+  }
+  if (!targetIds.length) {
+    console.warn('No Telegram chat id available. Send a message to the bot first.');
     return;
   }
-  const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ chat_id: chatId, text })
-  });
-  if (!res.ok) {
-    const body = await res.text().catch(() => '');
-    console.warn('Telegram sendMessage failed:', res.status, body);
+
+  for (const chatId of targetIds) {
+    const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
+    const body = {
+      chat_id: chatId,
+      text: payloadText,
+      disable_web_page_preview: true
+    };
+    if (options.replyToMessageId) {
+      body.reply_to_message_id = options.replyToMessageId;
+    }
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+    if (!res.ok) {
+      const respBody = await res.text().catch(() => '');
+      console.warn('Telegram sendMessage failed:', res.status, respBody);
+    }
   }
+}
+
+async function answerChatQuestion(chatId, text) {
+  if (!isLlmConfigured()) {
+    return getLlmConfigMessage();
+  }
+
+  const eventId = extractEventId(text);
+  const windowOverride = parseTimeWindowHours(text);
+  const windowHours = windowOverride || CHAT_EVENT_WINDOW_HOURS;
+
+  let events = [];
+  let note = '';
+
+  if (eventId) {
+    const event = await getEventById(eventId);
+    if (event) {
+      events = [event];
+    } else {
+      note = `No event found for id ${eventId}.`;
+    }
+  } else if (isSummaryRequest(text)) {
+    events = await getRecentEvents(windowHours, CHAT_EVENT_LIMIT);
+  } else {
+    const tokens = extractSearchTokens(text);
+    events = await searchEvents(tokens, windowHours, CHAT_EVENT_LIMIT);
+    if (!events.length) {
+      note = 'No direct keyword matches. Using most recent events.';
+      events = await getRecentEvents(windowHours, CHAT_EVENT_LIMIT);
+    }
+  }
+
+  const context = buildEventContext(events, windowHours, note);
+  const history = getChatHistory(chatId);
+  const messages = [
+    { role: 'system', content: SYSTEM_PROMPT },
+    { role: 'system', content: context },
+    ...history,
+    { role: 'user', content: text }
+  ];
+
+  const reply = await callLlm(messages);
+  addChatHistory(chatId, 'user', text);
+  addChatHistory(chatId, 'assistant', reply);
+  return reply || 'I could not generate a response.';
+}
+
+async function handleTelegramText(chatId, text, messageId) {
+  const trimmed = (text || '').trim();
+  if (!trimmed) return;
+  knownChatIds.add(String(chatId));
+
+  if (trimmed === '/start' || trimmed === '/help') {
+    const help = [
+      'ChatCam is online. You can ask about camera events.',
+      'Examples:',
+      '- "summary of the last 2 hours"',
+      '- "did someone enter the garage today?"',
+      '- "explain event #42"'
+    ].join('\n');
+    await sendTelegramMessage(help, { chatId, replyToMessageId: messageId });
+    return;
+  }
+
+  const reply = await answerChatQuestion(chatId, trimmed);
+  await sendTelegramMessage(reply, { chatId, replyToMessageId: messageId });
+}
+
+async function pollTelegramUpdates() {
+  if (!TELEGRAM_BOT_TOKEN || pollInFlight) return;
+  pollInFlight = true;
+  try {
+    const params = new URLSearchParams({
+      offset: String(updateOffset),
+      timeout: '0',
+      allowed_updates: JSON.stringify(['message', 'edited_message', 'channel_post', 'edited_channel_post'])
+    });
+    const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates?${params.toString()}`;
+    const res = await fetch(url);
+    if (!res.ok) {
+      console.warn('Telegram getUpdates failed:', res.status);
+      return;
+    }
+    const data = await res.json();
+    if (!data.ok || !Array.isArray(data.result)) {
+      console.warn('Telegram getUpdates error:', data);
+      return;
+    }
+
+    for (const update of data.result) {
+      updateOffset = Math.max(updateOffset, (update.update_id || 0) + 1);
+      const msg = update.message || update.edited_message || update.channel_post || update.edited_channel_post;
+      if (!msg || !msg.chat) continue;
+      const chatId = msg.chat.id;
+      if (typeof msg.text === 'string') {
+        await handleTelegramText(chatId, msg.text, msg.message_id);
+      }
+    }
+  } catch (err) {
+    console.warn('Telegram polling error:', err.message || err);
+  } finally {
+    pollInFlight = false;
+  }
+}
+
+function startTelegramPolling() {
+  if (!TELEGRAM_BOT_TOKEN) {
+    console.warn('TELEGRAM_BOT_TOKEN is not set. Telegram bot is disabled.');
+    return;
+  }
+  setInterval(() => {
+    pollTelegramUpdates().catch((err) => console.warn('Telegram polling failed:', err));
+  }, TELEGRAM_POLL_MS);
+  pollTelegramUpdates().catch((err) => console.warn('Telegram polling failed:', err));
 }
 
 function clampByte(value) {
@@ -190,21 +484,10 @@ async function generateCaption(image) {
   return generatedText.trim();
 }
 
-async function handleEvent(caption, jpegBuffer) {
-  await pool.query('INSERT INTO events (caption, image) VALUES ($1, $2)', [caption, jpegBuffer]);
-  await sendTelegramMessage(caption);
-}
-
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
 async function startAnalyzer() {
   await initDb();
   await initModel();
-  setInterval(() => {
-    fetchChatId().catch((err) => console.warn('Telegram chat id lookup failed:', err));
-  }, 5000);
+  startTelegramPolling();
 
   const wsUrl = buildWebSocketUrl(WEBRTC_BASE_URL);
   console.log('Connecting to WebRTC signaling:', wsUrl);
