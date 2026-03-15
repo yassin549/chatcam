@@ -9,6 +9,7 @@ const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
 const TELEGRAM_POLL_MS = Math.max(1000, parseInt(process.env.TELEGRAM_POLL_MS || '1500', 10));
 const TELEGRAM_LONG_POLL_SECONDS = Math.max(0, parseInt(process.env.TELEGRAM_LONG_POLL_SECONDS || '25', 10));
+const TELEGRAM_FETCH_TIMEOUT_MS = Math.max(5000, parseInt(process.env.TELEGRAM_FETCH_TIMEOUT_MS || '35000', 10));
 const TELEGRAM_CLEAR_WEBHOOK = (process.env.TELEGRAM_CLEAR_WEBHOOK || 'true').toLowerCase() === 'true';
 const TELEGRAM_DEBUG = (process.env.TELEGRAM_DEBUG || '').toLowerCase() === 'true';
 
@@ -188,6 +189,20 @@ function safeParseJson(text) {
   }
 }
 
+async function fetchWithTimeout(url, options, timeoutMs) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function fetchTelegram(url, options = {}, timeoutMs = TELEGRAM_FETCH_TIMEOUT_MS) {
+  return await fetchWithTimeout(url, options, timeoutMs);
+}
+
 function getLlmUnavailableMessage() {
   return 'LLM is down right now, so I can’t answer at the moment. Please try again later.';
 }
@@ -282,9 +297,10 @@ async function clearTelegramWebhook() {
   if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CLEAR_WEBHOOK) return;
   try {
     const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/deleteWebhook?drop_pending_updates=true`;
-    const res = await fetch(url);
+    const res = await fetchTelegram(url);
     if (!res.ok) {
-      console.warn('Telegram deleteWebhook failed:', res.status);
+      const body = await res.text().catch(() => '');
+      console.warn('Telegram deleteWebhook failed:', res.status, body);
       return;
     }
     if (TELEGRAM_DEBUG) {
@@ -455,7 +471,7 @@ async function sendTelegramMessage(text, options = {}) {
       body.reply_to_message_id = options.replyToMessageId;
     }
     try {
-      const res = await fetch(url, {
+      const res = await fetchTelegram(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body)
@@ -467,7 +483,11 @@ async function sendTelegramMessage(text, options = {}) {
     } catch (err) {
       const cause = err && err.cause ? err.cause : null;
       const extra = cause && cause.code ? ` code=${cause.code}` : '';
-      console.warn(`Telegram sendMessage fetch failed:${extra}`, err.message || err);
+      if (err && err.name === 'AbortError') {
+        console.warn(`Telegram sendMessage timeout:${extra}`);
+      } else {
+        console.warn(`Telegram sendMessage fetch failed:${extra}`, err.message || err);
+      }
     }
   }
 }
@@ -505,7 +525,7 @@ async function sendTelegramPhoto(imageBuffer, options = {}) {
     try {
       const blob = new Blob([imageBuffer], { type: 'image/jpeg' });
       form.append('photo', blob, 'event.jpg');
-      const res = await fetch(url, { method: 'POST', body: form });
+      const res = await fetchTelegram(url, { method: 'POST', body: form });
       if (!res.ok) {
         const respBody = await res.text().catch(() => '');
         console.warn('Telegram sendPhoto failed:', res.status, respBody);
@@ -513,7 +533,11 @@ async function sendTelegramPhoto(imageBuffer, options = {}) {
     } catch (err) {
       const cause = err && err.cause ? err.cause : null;
       const extra = cause && cause.code ? ` code=${cause.code}` : '';
-      console.warn(`Telegram sendPhoto fetch failed:${extra}`, err.message || err);
+      if (err && err.name === 'AbortError') {
+        console.warn(`Telegram sendPhoto timeout:${extra}`);
+      } else {
+        console.warn(`Telegram sendPhoto fetch failed:${extra}`, err.message || err);
+      }
     }
   }
 }
@@ -695,9 +719,10 @@ async function pollTelegramUpdates() {
       allowed_updates: JSON.stringify(['message', 'edited_message', 'channel_post', 'edited_channel_post'])
     });
     const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates?${params.toString()}`;
-    const res = await fetch(url);
+    const res = await fetchTelegram(url, {}, TELEGRAM_FETCH_TIMEOUT_MS + (TELEGRAM_LONG_POLL_SECONDS * 1000));
     if (!res.ok) {
-      console.warn('Telegram getUpdates failed:', res.status);
+      const body = await res.text().catch(() => '');
+      console.warn('Telegram getUpdates failed:', res.status, body);
       return;
     }
     const data = await res.json();
@@ -721,7 +746,11 @@ async function pollTelegramUpdates() {
   } catch (err) {
     const cause = err && err.cause ? err.cause : null;
     const extra = cause && cause.code ? ` code=${cause.code}` : '';
-    console.warn(`Telegram polling error:${extra}`, err.message || err);
+    if (err && err.name === 'AbortError') {
+      console.warn(`Telegram polling timeout:${extra}`);
+    } else {
+      console.warn(`Telegram polling error:${extra}`, err.message || err);
+    }
   } finally {
     pollInFlight = false;
   }
