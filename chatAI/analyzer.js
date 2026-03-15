@@ -20,7 +20,7 @@ const WEBRTC_SUSPEND_AFTER_MS = Math.max(0, parseInt(process.env.WEBRTC_SUSPEND_
 const WEBRTC_SUSPEND_CHECK_MS = Math.max(5000, parseInt(process.env.WEBRTC_SUSPEND_CHECK_MS || '30000', 10));
 const WEBRTC_MODEL_ON_CONNECT = (process.env.WEBRTC_MODEL_ON_CONNECT || 'true').toLowerCase() === 'true';
 const ANALYZE_FPS = Math.max(0.1, parseFloat(process.env.ANALYZE_FPS || '1'));
-const MODEL_ID = process.env.MODEL_ID || 'onnx-community/Florence-2-base';
+const MODEL_ID = process.env.MODEL_ID || 'Xenova/vit-gpt2-image-captioning';
 const MODEL_DTYPE = process.env.MODEL_DTYPE || 'fp32';
 const CAPTION_TASK = process.env.CAPTION_TASK || '<MORE_DETAILED_CAPTION>';
 const MAX_NEW_TOKENS = parseInt(process.env.MAX_NEW_TOKENS || '96', 10);
@@ -72,8 +72,7 @@ const pool = new Pool({
   connectionString: process.env.DATABASE_URL
 });
 
-let model;
-let processor;
+let captioner;
 let RawImage;
 let modelReady = false;
 let modelLoading = false;
@@ -806,30 +805,18 @@ async function ensureModelLoaded() {
 async function initModel() {
   console.log('Loading vision model...');
   const transformers = await import('@huggingface/transformers');
-  const { Florence2ForConditionalGeneration, AutoProcessor: HFProcessor, RawImage: HFImage } = transformers;
+  const { pipeline, RawImage: HFImage } = transformers;
   RawImage = HFImage;
-  processor = await HFProcessor.from_pretrained(MODEL_ID);
-  model = await Florence2ForConditionalGeneration.from_pretrained(MODEL_ID, { dtype: MODEL_DTYPE });
+  captioner = await pipeline('image-to-text', MODEL_ID);
   modelReady = true;
   console.log('Vision model ready.');
 }
 
 async function generateCaption(image) {
-  const prompts = processor.construct_prompts(CAPTION_TASK);
-  const inputs = await processor(image, prompts);
-  const generatedIds = await model.generate({
-    ...inputs,
-    max_new_tokens: MAX_NEW_TOKENS
-  });
-  const generatedText = processor.batch_decode(generatedIds, { skip_special_tokens: false })[0];
-  const result = processor.post_process_generation(generatedText, CAPTION_TASK, image.size);
-  if (typeof result === 'string') return result.trim();
-  if (result && typeof result === 'object' && result[CAPTION_TASK]) {
-    const value = result[CAPTION_TASK];
-    if (Array.isArray(value)) return value.join(' ').trim();
-    return String(value).trim();
-  }
-  return generatedText.trim();
+  const output = await captioner(image, { max_new_tokens: MAX_NEW_TOKENS });
+  const result = Array.isArray(output) ? output[0] : output;
+  const text = result && (result.generated_text || result.text) ? (result.generated_text || result.text) : '';
+  return String(text || '').trim();
 }
 
 async function startAnalyzer() {
