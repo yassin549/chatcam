@@ -24,9 +24,11 @@ const MIN_EVENT_SECONDS = Math.max(0, parseFloat(process.env.MIN_EVENT_SECONDS |
 
 const CHAT_HISTORY_LIMIT = Math.max(2, parseInt(process.env.CHAT_HISTORY_LIMIT || '8', 10));
 const CHAT_EVENT_LIMIT = Math.max(1, parseInt(process.env.CHAT_EVENT_LIMIT || '20', 10));
+const CHAT_EVENT_LIMIT_MAX = Math.max(CHAT_EVENT_LIMIT, parseInt(process.env.CHAT_EVENT_LIMIT_MAX || '100', 10));
 const CHAT_EVENT_WINDOW_HOURS = Math.max(1, parseFloat(process.env.CHAT_EVENT_WINDOW_HOURS || '24'));
 
 const LLM_BACKEND = (process.env.LLM_BACKEND || 'disabled').toLowerCase();
+const LLM_ROUTER_ENABLED = (process.env.LLM_ROUTER_ENABLED || 'true').toLowerCase() === 'true';
 const DEFAULT_OPENAI_MODEL = 'gpt-4o-mini';
 const DEFAULT_GROQ_MODEL = 'llama-3.1-8b-instant';
 const DEFAULT_GEMINI_MODEL = 'gemini-2.0-flash';
@@ -96,6 +98,19 @@ const SYSTEM_PROMPT = [
   'Do not invent events or details that are not in the context.'
 ].join(' ');
 
+const ROUTER_PROMPT = [
+  'You are a routing assistant for a camera events Telegram bot.',
+  'Return ONLY a JSON object with this schema:',
+  '{"action":"answer|send_photo|db_stats","event_id":number|null,"window_hours":number|null,"limit":number|null}.',
+  'Use action="send_photo" if the user asks to send/show/share a photo, picture, image, or snapshot.',
+  'Use action="db_stats" if the user asks whether the database is empty, how many events exist, or when the last event happened.',
+  'Use action="answer" for all other questions.',
+  'If the user refers to a specific event id (like "event #42"), set event_id.',
+  'If the user asks for a time range, set window_hours (e.g. "last 2 hours" => 2, "today" => 24).',
+  'If the user asks for N events, set limit.',
+  'Return JSON only with double quotes.'
+].join(' ');
+
 function normalizeCaption(text) {
   return text
     .toLowerCase()
@@ -156,6 +171,18 @@ function extractSearchTokens(text) {
   return tokens.slice(0, 8);
 }
 
+function safeParseJson(text) {
+  if (!text) return null;
+  const start = text.indexOf('{');
+  const end = text.lastIndexOf('}');
+  if (start < 0 || end < 0 || end <= start) return null;
+  try {
+    return JSON.parse(text.slice(start, end + 1));
+  } catch (err) {
+    return null;
+  }
+}
+
 function truncateTelegramText(text) {
   if (text.length <= 3900) return text;
   return `${text.slice(0, 3900)}...`;
@@ -165,6 +192,11 @@ function truncateTelegramCaption(text) {
   if (!text) return '';
   if (text.length <= 1000) return text;
   return `${text.slice(0, 1000)}...`;
+}
+
+function clampEventLimit(value) {
+  if (!Number.isFinite(value)) return CHAT_EVENT_LIMIT;
+  return Math.min(CHAT_EVENT_LIMIT_MAX, Math.max(1, Math.floor(value)));
 }
 
 function buildEventContext(events, windowHours, note) {
@@ -492,14 +524,17 @@ async function sendTelegramPhoto(imageBuffer, options = {}) {
   }
 }
 
-async function answerChatQuestion(chatId, text) {
+async function answerChatQuestion(chatId, text, overrides = {}) {
   if (!isLlmConfigured()) {
     return getLlmConfigMessage();
   }
 
-  const eventId = extractEventId(text);
-  const windowOverride = parseTimeWindowHours(text);
+  const eventId = Number.isFinite(overrides.eventId) ? overrides.eventId : extractEventId(text);
+  const windowOverride = Number.isFinite(overrides.windowHours) ? overrides.windowHours : parseTimeWindowHours(text);
   const windowHours = windowOverride || CHAT_EVENT_WINDOW_HOURS;
+  const limit = clampEventLimit(Number.isFinite(overrides.limit) ? overrides.limit : CHAT_EVENT_LIMIT);
+  const summaryRequest = typeof overrides.summary === 'boolean' ? overrides.summary : isSummaryRequest(text);
+  const tokenOverride = Array.isArray(overrides.searchTokens) ? overrides.searchTokens : null;
 
   let events = [];
   let note = '';
@@ -511,14 +546,14 @@ async function answerChatQuestion(chatId, text) {
     } else {
       note = `No event found for id ${eventId}.`;
     }
-  } else if (isSummaryRequest(text)) {
-    events = await getRecentEvents(windowHours, CHAT_EVENT_LIMIT);
+  } else if (summaryRequest) {
+    events = await getRecentEvents(windowHours, limit);
   } else {
-    const tokens = extractSearchTokens(text);
-    events = await searchEvents(tokens, windowHours, CHAT_EVENT_LIMIT);
+    const tokens = tokenOverride || extractSearchTokens(text);
+    events = await searchEvents(tokens, windowHours, limit);
     if (!events.length) {
       note = 'No direct keyword matches. Using most recent events.';
-      events = await getRecentEvents(windowHours, CHAT_EVENT_LIMIT);
+      events = await getRecentEvents(windowHours, limit);
     }
   }
 
@@ -549,8 +584,57 @@ function isDatabaseStatusRequest(text) {
     || /\bevents?\s+recorded\b/i.test(text);
 }
 
-async function handlePhotoRequest(chatId, text, messageId) {
-  const eventId = extractEventId(text);
+function normalizeRoute(route) {
+  if (!route || typeof route !== 'object') return null;
+  const action = typeof route.action === 'string' ? route.action.toLowerCase() : '';
+  if (!['answer', 'send_photo', 'db_stats'].includes(action)) return null;
+  const eventIdRaw = route.event_id === null || route.event_id === undefined ? null : Number(route.event_id);
+  const windowHoursRaw = route.window_hours === null || route.window_hours === undefined ? null : Number(route.window_hours);
+  const limitRaw = route.limit === null || route.limit === undefined ? null : Number(route.limit);
+  return {
+    action,
+    eventId: Number.isFinite(eventIdRaw) ? Math.floor(eventIdRaw) : null,
+    windowHours: Number.isFinite(windowHoursRaw) ? Math.max(0.1, windowHoursRaw) : null,
+    limit: Number.isFinite(limitRaw) ? clampEventLimit(limitRaw) : null
+  };
+}
+
+function routeFromHeuristics(text) {
+  if (isPhotoRequest(text)) return { action: 'send_photo', eventId: null, windowHours: null, limit: null };
+  if (isDatabaseStatusRequest(text)) return { action: 'db_stats', eventId: null, windowHours: null, limit: null };
+  return { action: 'answer', eventId: null, windowHours: null, limit: null };
+}
+
+async function routeUserRequest(text) {
+  if (!LLM_ROUTER_ENABLED || !isLlmConfigured()) {
+    return routeFromHeuristics(text);
+  }
+  try {
+    const messages = [
+      { role: 'system', content: ROUTER_PROMPT },
+      { role: 'user', content: text }
+    ];
+    const raw = await callLlm(messages);
+    const parsed = safeParseJson(raw);
+    const normalized = normalizeRoute(parsed);
+    if (!normalized) {
+      if (TELEGRAM_DEBUG) {
+        console.warn('Router parse failed, falling back to heuristics:', raw);
+      }
+      return routeFromHeuristics(text);
+    }
+    if (TELEGRAM_DEBUG) {
+      console.log('Router decision:', normalized);
+    }
+    return normalized;
+  } catch (err) {
+    console.warn('Router error, falling back to heuristics:', err.message || err);
+    return routeFromHeuristics(text);
+  }
+}
+
+async function handlePhotoRequest(chatId, text, messageId, overrides = {}) {
+  const eventId = Number.isFinite(overrides.eventId) ? overrides.eventId : extractEventId(text);
   const event = eventId ? await getEventByIdWithImage(eventId) : await getLatestEventWithImage();
   if (!event) {
     const message = eventId
@@ -584,7 +668,7 @@ async function handleTelegramText(chatId, text, messageId) {
 
   if (trimmed === '/start' || trimmed === '/help') {
     const help = [
-      'ChatCam is online. You can ask about camera events.',
+      'ChatCam is online. Ask in plain language about camera events or photos.',
       'Examples:',
       '- "summary of the last 2 hours"',
       '- "did someone enter the garage today?"',
@@ -597,15 +681,20 @@ async function handleTelegramText(chatId, text, messageId) {
   }
 
   try {
-    if (isPhotoRequest(trimmed)) {
-      await handlePhotoRequest(chatId, trimmed, messageId);
+    const route = await routeUserRequest(trimmed);
+    if (route.action === 'send_photo') {
+      await handlePhotoRequest(chatId, trimmed, messageId, route);
       return;
     }
-    if (isDatabaseStatusRequest(trimmed)) {
+    if (route.action === 'db_stats') {
       await handleDatabaseStatusRequest(chatId, messageId);
       return;
     }
-    const reply = await answerChatQuestion(chatId, trimmed);
+    const reply = await answerChatQuestion(chatId, trimmed, {
+      eventId: route.eventId,
+      windowHours: route.windowHours,
+      limit: route.limit
+    });
     await sendTelegramMessage(reply, { chatId, replyToMessageId: messageId });
   } catch (err) {
     console.warn('Telegram handler error:', err.message || err);
