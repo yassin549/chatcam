@@ -395,14 +395,20 @@ async function sendTelegramMessage(text, options = {}) {
     if (options.replyToMessageId) {
       body.reply_to_message_id = options.replyToMessageId;
     }
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body)
-    });
-    if (!res.ok) {
-      const respBody = await res.text().catch(() => '');
-      console.warn('Telegram sendMessage failed:', res.status, respBody);
+    try {
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+      });
+      if (!res.ok) {
+        const respBody = await res.text().catch(() => '');
+        console.warn('Telegram sendMessage failed:', res.status, respBody);
+      }
+    } catch (err) {
+      const cause = err && err.cause ? err.cause : null;
+      const extra = cause && cause.code ? ` code=${cause.code}` : '';
+      console.warn(`Telegram sendMessage fetch failed:${extra}`, err.message || err);
     }
   }
 }
@@ -469,8 +475,16 @@ async function handleTelegramText(chatId, text, messageId) {
     return;
   }
 
-  const reply = await answerChatQuestion(chatId, trimmed);
-  await sendTelegramMessage(reply, { chatId, replyToMessageId: messageId });
+  try {
+    const reply = await answerChatQuestion(chatId, trimmed);
+    await sendTelegramMessage(reply, { chatId, replyToMessageId: messageId });
+  } catch (err) {
+    console.warn('Telegram handler error:', err.message || err);
+    await sendTelegramMessage('Sorry, I hit an error while answering that.', {
+      chatId,
+      replyToMessageId: messageId
+    });
+  }
 }
 
 async function pollTelegramUpdates() {
@@ -507,7 +521,9 @@ async function pollTelegramUpdates() {
       }
     }
   } catch (err) {
-    console.warn('Telegram polling error:', err.message || err);
+    const cause = err && err.cause ? err.cause : null;
+    const extra = cause && cause.code ? ` code=${cause.code}` : '';
+    console.warn(`Telegram polling error:${extra}`, err.message || err);
   } finally {
     pollInFlight = false;
   }
