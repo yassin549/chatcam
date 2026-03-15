@@ -183,6 +183,10 @@ function safeParseJson(text) {
   }
 }
 
+function getLlmUnavailableMessage() {
+  return 'LLM is down right now, so I can’t answer at the moment. Please try again later.';
+}
+
 function truncateTelegramText(text) {
   if (text.length <= 3900) return text;
   return `${text.slice(0, 3900)}...`;
@@ -298,22 +302,7 @@ function isLlmConfigured() {
 }
 
 function getLlmConfigMessage() {
-  if (LLM_BACKEND === 'gemini') {
-    return [
-      'LLM is not configured. Set these environment variables on Render:',
-      '- LLM_BACKEND=gemini',
-      '- GEMINI_API_KEY=your_api_key',
-      `- LLM_MODEL=${DEFAULT_GEMINI_MODEL} (or another Gemini model)`
-    ].join('\n');
-  }
-
-  return [
-    'LLM is not configured. Set these environment variables on Render:',
-    '- LLM_BACKEND=openai_compat',
-    '- LLM_API_KEY=your_api_key (or GROQ_API_KEY)',
-    `- LLM_MODEL=${DEFAULT_OPENAI_MODEL} (or ${DEFAULT_GROQ_MODEL} on Groq)`,
-    `- LLM_BASE_URL=${DEFAULT_OPENAI_BASE} (or ${DEFAULT_GROQ_BASE} for Groq)`
-  ].join('\n');
+  return getLlmUnavailableMessage();
 }
 
 async function callOpenAiCompat(messages) {
@@ -572,18 +561,6 @@ async function answerChatQuestion(chatId, text, overrides = {}) {
   return reply || 'I could not generate a response.';
 }
 
-function isPhotoRequest(text) {
-  if (/^\/(photo|picture|image|snapshot|lastphoto)\b/i.test(text)) return true;
-  return /\b(last|latest)\b.*\b(photo|picture|image|snapshot)\b/i.test(text)
-    || /\b(send|show|share)\b.*\b(photo|picture|image|snapshot)\b/i.test(text);
-}
-
-function isDatabaseStatusRequest(text) {
-  return /\b(database|db)\b.*\bempty\b/i.test(text)
-    || /\bany\b.*\bevents\b/i.test(text)
-    || /\bevents?\s+recorded\b/i.test(text);
-}
-
 function normalizeRoute(route) {
   if (!route || typeof route !== 'object') return null;
   const action = typeof route.action === 'string' ? route.action.toLowerCase() : '';
@@ -599,15 +576,9 @@ function normalizeRoute(route) {
   };
 }
 
-function routeFromHeuristics(text) {
-  if (isPhotoRequest(text)) return { action: 'send_photo', eventId: null, windowHours: null, limit: null };
-  if (isDatabaseStatusRequest(text)) return { action: 'db_stats', eventId: null, windowHours: null, limit: null };
-  return { action: 'answer', eventId: null, windowHours: null, limit: null };
-}
-
 async function routeUserRequest(text) {
   if (!LLM_ROUTER_ENABLED || !isLlmConfigured()) {
-    return routeFromHeuristics(text);
+    return null;
   }
   try {
     const messages = [
@@ -619,17 +590,17 @@ async function routeUserRequest(text) {
     const normalized = normalizeRoute(parsed);
     if (!normalized) {
       if (TELEGRAM_DEBUG) {
-        console.warn('Router parse failed, falling back to heuristics:', raw);
+        console.warn('Router parse failed:', raw);
       }
-      return routeFromHeuristics(text);
+      return null;
     }
     if (TELEGRAM_DEBUG) {
       console.log('Router decision:', normalized);
     }
     return normalized;
   } catch (err) {
-    console.warn('Router error, falling back to heuristics:', err.message || err);
-    return routeFromHeuristics(text);
+    console.warn('Router error:', err.message || err);
+    return null;
   }
 }
 
@@ -682,6 +653,10 @@ async function handleTelegramText(chatId, text, messageId) {
 
   try {
     const route = await routeUserRequest(trimmed);
+    if (!route) {
+      await sendTelegramMessage(getLlmUnavailableMessage(), { chatId, replyToMessageId: messageId });
+      return;
+    }
     if (route.action === 'send_photo') {
       await handlePhotoRequest(chatId, trimmed, messageId, route);
       return;
@@ -698,7 +673,7 @@ async function handleTelegramText(chatId, text, messageId) {
     await sendTelegramMessage(reply, { chatId, replyToMessageId: messageId });
   } catch (err) {
     console.warn('Telegram handler error:', err.message || err);
-    await sendTelegramMessage('Sorry, I hit an error while answering that.', {
+    await sendTelegramMessage(getLlmUnavailableMessage(), {
       chatId,
       replyToMessageId: messageId
     });
