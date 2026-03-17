@@ -624,11 +624,6 @@ async function handleTelegramText(chatId, text, messageId) {
   if (!trimmed) return;
   knownChatIds.add(String(chatId));
 
-  if (!isLlmConfigured() || !LLM_ROUTER_ENABLED) {
-    await sendTelegramMessage(getLlmUnavailableMessage(), { chatId, replyToMessageId: messageId });
-    return;
-  }
-
   if (trimmed === '/start' || trimmed === '/help') {
     const help = [
       'ChatCam is online. Ask in plain language about camera events or photos.',
@@ -640,6 +635,11 @@ async function handleTelegramText(chatId, text, messageId) {
       '- "is the database empty?"'
     ].join('\n');
     await sendTelegramMessage(help, { chatId, replyToMessageId: messageId });
+    return;
+  }
+
+  if (!isLlmConfigured() || !LLM_ROUTER_ENABLED) {
+    await sendTelegramMessage(getLlmUnavailableMessage(), { chatId, replyToMessageId: messageId });
     return;
   }
 
@@ -726,6 +726,7 @@ function startTelegramPolling() {
     return;
   }
   clearTelegramWebhook().catch((err) => console.warn('Telegram deleteWebhook failed:', err));
+  console.log('Telegram polling started.');
   setInterval(() => {
     pollTelegramUpdates().catch((err) => console.warn('Telegram polling failed:', err));
   }, TELEGRAM_POLL_MS);
