@@ -646,7 +646,8 @@ async function handleTelegramText(chatId, text, messageId) {
   try {
     const route = await routeUserRequest(trimmed);
     if (!route) {
-      await sendTelegramMessage(getLlmUnavailableMessage(), { chatId, replyToMessageId: messageId });
+      const reply = await answerChatQuestion(chatId, trimmed, {});
+      await sendTelegramMessage(reply, { chatId, replyToMessageId: messageId });
       return;
     }
     if (route.action === 'send_photo') {
