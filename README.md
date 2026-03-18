@@ -51,13 +51,9 @@ npm rm node-pre-gyp --save-dev
 ```
 
 ## Configure RTSP
-The RTSP URL is hardcoded in `server.js`:
-```js
-const RTSP_URL = 'rtsp://pyuser:yacine03041973@192.168.1.70:554/cam/realmonitor?channel=1&subtype=0';
-```
-Update this string for your camera. If you change credentials, keep in mind the URL must include them in the format:
-```
-rtsp://username:password@host:port/path
+Set the RTSP URL via environment variable before starting the server:
+```powershell
+$env:RTSP_URL="rtsp://username:password@host:port/path"
 ```
 
 ## Run
@@ -76,6 +72,7 @@ ngrok http 8080
 Open the HTTPS forwarding URL shown by ngrok.
 
 ## Environment Variables
+- `RTSP_URL` (required, e.g. `rtsp://user:pass@host:554/stream`)
 - `PORT` (default `8080`)
 - `WIDTH` (default `1280`)
 - `HEIGHT` (default `720`)
@@ -99,7 +96,7 @@ node server.js
 6) The browser receives a track and attaches it to a `<video>` element.
 
 ## Analyzer (Render)
-The Render analyzer lives in `chatAI/`. It connects to the WebRTC stream, samples ~1 fps, captions frames with Florence-2, stores new events in Postgres, and sends Telegram notifications.
+The Render analyzer lives in `chatAI/`. It connects to the WebRTC stream, samples ~1 fps, captions frames with `Xenova/vit-gpt2-image-captioning`, stores new events in Postgres, and sends Telegram notifications.
 
 ### Run (local or Render)
 ```powershell
@@ -109,52 +106,19 @@ npm run analyze
 
 ### Required env vars
 - `DATABASE_URL` (Postgres connection string)
+- `TELEGRAM_BOT_TOKEN` (Telegram bot token)
 
 ### Optional env vars
-- `WEBRTC_URL` (default: current ngrok URL)
+- `WEBRTC_URL` (default: `http://localhost:8080`)
 - `ANALYZE_FPS` (default: `1`)
-- `MODEL_ID` (default: `onnx-community/Florence-2-base`)
+- `MODEL_ID` (default: `Xenova/vit-gpt2-image-captioning`)
 - `MODEL_DTYPE` (default: `fp32`)
-- `CAPTION_TASK` (default: `<MORE_DETAILED_CAPTION>`)
 - `MAX_NEW_TOKENS` (default: `96`)
 - `JPEG_QUALITY` (default: `70`)
 - `MIN_EVENT_SECONDS` (default: `5`)
 
 ### Telegram
-- The bot token is hardcoded in `chatAI/analyzer.js`.
-- Send at least one message to the bot (`@chatcamAIbot`) so `getUpdates` can resolve your chat id.
-
-<<<<<<< HEAD
-<<<<<<< HEAD
-=======
-## Analyzer (Render)
-This repo also includes a headless analyzer that connects to the WebRTC stream, samples ~1 fps, captions each sampled frame with Florence-2, stores new events in Postgres, and sends Telegram notifications.
-
-### Run (local or Render)
-```powershell
-npm run analyze
-```
-
-### Required env vars
-- `DATABASE_URL` (Render Postgres connection string)
-
-### Optional env vars
-- `WEBRTC_URL` (default: current ngrok URL)
-- `ANALYZE_FPS` (default: `1`)
-- `MODEL_ID` (default: `onnx-community/Florence-2-base`)
-- `MODEL_DTYPE` (default: `fp32`)
-- `CAPTION_TASK` (default: `<MORE_DETAILED_CAPTION>`)
-- `MAX_NEW_TOKENS` (default: `96`)
-- `JPEG_QUALITY` (default: `70`)
-- `MIN_EVENT_SECONDS` (default: `5`)
-
-### Telegram
-- The bot token is hardcoded in `analyzer.js`.
-- Send at least one message to the bot (`@chatcamAIbot`) so `getUpdates` can resolve your chat id.
-
->>>>>>> 6c0dbc3 (added the LLM and chat option for telegram bot)
-=======
->>>>>>> 1b6a8fd075b7d24e7571f1640cd1eb525a9ba04d
+- Send at least one message to the bot so `getUpdates` can resolve your chat id.
 ## Troubleshooting
 ### WebRTC viewer stuck on "Connecting..."
 - Ensure the server logs show FFmpeg is producing frames (look for `frame=` output).
@@ -177,6 +141,5 @@ ffmpeg -rtsp_transport tcp -i "rtsp://user:pass@host:554/stream" -t 5 -f null -
 - If you need even lower latency, consider tuning FPS or resolution.
 
 ## Security Notes
-- The RTSP URL includes credentials in plain text in `server.js`.
 - Do not commit secrets to a public repo.
 - If you used ngrok authtokens in a shared session, rotate them.

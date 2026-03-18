@@ -6,8 +6,12 @@ const WebSocket = require('ws');
 const wrtc = require('wrtc');
 
 const PORT = parseInt(process.env.PORT || '8080', 10);
-// Hardcoded RTSP URL (credentials included). Change if needed.
-const RTSP_URL = 'rtsp://pyuser:yacine03041973@192.168.1.70:554/cam/realmonitor?channel=1&subtype=0';
+const RTSP_URL = process.env.RTSP_URL || '';
+
+if (!RTSP_URL) {
+  console.error('RTSP_URL is required.');
+  process.exit(1);
+}
 
 const WIDTH = parseInt(process.env.WIDTH || '1280', 10);
 const HEIGHT = parseInt(process.env.HEIGHT || '720', 10);

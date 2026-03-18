@@ -14,7 +14,7 @@ const TELEGRAM_CLEAR_WEBHOOK = (process.env.TELEGRAM_CLEAR_WEBHOOK || 'true').to
 const TELEGRAM_DEBUG = (process.env.TELEGRAM_DEBUG || '').toLowerCase() === 'true';
 
 const PORT = parseInt(process.env.PORT || '8080', 10);
-const WEBRTC_BASE_URL = process.env.WEBRTC_URL || 'https://deafly-kinaesthetic-sadye.ngrok-free.dev';
+const WEBRTC_BASE_URL = process.env.WEBRTC_URL || 'http://localhost:8080';
 const WEBRTC_RECONNECT_MIN_MS = Math.max(1000, parseInt(process.env.WEBRTC_RECONNECT_MIN_MS || '2000', 10));
 const WEBRTC_RECONNECT_MAX_MS = Math.max(WEBRTC_RECONNECT_MIN_MS, parseInt(process.env.WEBRTC_RECONNECT_MAX_MS || '60000', 10));
 const WEBRTC_SUSPEND_AFTER_MS = Math.max(0, parseInt(process.env.WEBRTC_SUSPEND_AFTER_MS || '300000', 10));
@@ -62,6 +62,10 @@ if ((process.env.DNS_IPV4_FIRST || 'true').toLowerCase() === 'true') {
   } catch (err) {
     console.warn('DNS result order not set:', err.message || err);
   }
+}
+
+if (!process.env.WEBRTC_URL) {
+  console.warn('WEBRTC_URL not set; defaulting to http://localhost:8080');
 }
 
 if (!process.env.DATABASE_URL) {
