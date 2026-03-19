@@ -90,13 +90,13 @@ const knownChatIds = new Set();
 const chatHistory = new Map();
 
 const SYSTEM_PROMPT = [
-  'You are ChatCam, a camera event manager.',
-  'Answer questions using ONLY the event context provided.',
-  'If the context is empty or insufficient, say so and ask a clarifying question.',
-  'If asked whether something happened, answer yes or no based on events and cite event ids and timestamps.',
-  'If asked for a summary, provide a concise summary and highlight notable events.',
-  'If asked to explain an event, explain based on the caption and context only.',
-  'Do not invent events or details that are not in the context.'
+  'You are ChatCam, a friendly camera assistant.',
+  'You can chat naturally with the user.',
+  'When the user asks about camera events, photos, or the database, answer ONLY using the event context provided.',
+  'Never invent events or details that are not in the context.',
+  'If the context is empty or insufficient for an event-related question, say so and ask for a helpful detail (like a time range).',
+  'Do not ask the user to "add events to the context".',
+  'If the user is greeting or making small talk that is not about events, respond briefly and naturally, then ask what they want to know about the camera.'
 ].join(' ');
 
 const ROUTER_PROMPT = [
@@ -205,7 +205,8 @@ function clampEventLimit(value) {
 
 function buildEventContext(events, windowHours, note) {
   const lines = [];
-  lines.push(`Event context window: last ${windowHours} hour(s).`);
+  lines.push('Event context (use only for event-related questions).');
+  lines.push(`Window: last ${windowHours} hour(s).`);
   if (note) lines.push(`Note: ${note}`);
   if (!events.length) {
     lines.push('No events found in this window.');
