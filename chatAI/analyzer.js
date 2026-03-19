@@ -13,7 +13,7 @@ const TELEGRAM_FETCH_TIMEOUT_MS = Math.max(5000, parseInt(process.env.TELEGRAM_F
 const TELEGRAM_CLEAR_WEBHOOK = (process.env.TELEGRAM_CLEAR_WEBHOOK || 'true').toLowerCase() === 'true';
 const TELEGRAM_DEBUG = (process.env.TELEGRAM_DEBUG || '').toLowerCase() === 'true';
 
-const PORT = parseInt(process.env.PORT || '8080', 10);
+const HEALTH_PORT = parseInt(process.env.ANALYZER_PORT || process.env.PORT || '8090', 10);
 const WEBRTC_BASE_URL = process.env.WEBRTC_URL || 'http://localhost:8080';
 const WEBRTC_RECONNECT_MIN_MS = Math.max(1000, parseInt(process.env.WEBRTC_RECONNECT_MIN_MS || '2000', 10));
 const WEBRTC_RECONNECT_MAX_MS = Math.max(WEBRTC_RECONNECT_MIN_MS, parseInt(process.env.WEBRTC_RECONNECT_MAX_MS || '60000', 10));
@@ -123,9 +123,20 @@ function normalizeCaption(text) {
 }
 
 function buildWebSocketUrl(baseUrl) {
-  const url = new URL(baseUrl);
-  const wsProtocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
-  url.protocol = wsProtocol;
+  let url;
+  try {
+    url = new URL(baseUrl);
+  } catch (err) {
+    throw new Error(`WEBRTC_URL must be a valid URL (got "${baseUrl}").`);
+  }
+  const protocol = url.protocol;
+  if (protocol === 'https:' || protocol === 'wss:') {
+    url.protocol = 'wss:';
+  } else if (protocol === 'http:' || protocol === 'ws:') {
+    url.protocol = 'ws:';
+  } else {
+    throw new Error(`WEBRTC_URL must use http/https/ws/wss (got "${protocol}").`);
+  }
   url.pathname = '/ws';
   url.search = '';
   return url.toString();
@@ -827,7 +838,13 @@ async function startAnalyzer() {
     });
   }
 
-  const wsUrl = buildWebSocketUrl(WEBRTC_BASE_URL);
+  let wsUrl;
+  try {
+    wsUrl = buildWebSocketUrl(WEBRTC_BASE_URL);
+  } catch (err) {
+    console.error(err.message || err);
+    process.exit(1);
+  }
   console.log('Connecting to WebRTC signaling:', wsUrl);
 
   let lastFrameAt = 0;
@@ -1016,8 +1033,8 @@ http.createServer((req, res) => {
   }
   res.writeHead(404);
   res.end('not found');
-}).listen(PORT, () => {
-  console.log(`Analyzer health server on :${PORT}`);
+}).listen(HEALTH_PORT, () => {
+  console.log(`Analyzer health server on :${HEALTH_PORT}`);
 });
 
 startAnalyzer().catch((err) => {

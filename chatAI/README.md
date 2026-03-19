@@ -108,13 +108,14 @@ npm run analyze
 - `TELEGRAM_BOT_TOKEN` (Telegram bot token)
 
 ### Optional env vars
-- `WEBRTC_URL` (default: `http://localhost:8080`)
+- `WEBRTC_URL` (default: `http://localhost:8080`, must be a full `http(s)` or `ws(s)` URL)
 - `ANALYZE_FPS` (default: `1`)
 - `MODEL_ID` (default: `Xenova/vit-gpt2-image-captioning`)
 - `MODEL_DTYPE` (default: `fp32`)
 - `MAX_NEW_TOKENS` (default: `96`)
 - `JPEG_QUALITY` (default: `70`)
 - `MIN_EVENT_SECONDS` (default: `5`)
+- `ANALYZER_PORT` (health server port, default: `8090` when `PORT` is not set)
 
 ### Telegram
 - Send at least one message to the bot so `getUpdates` can resolve your chat id.
