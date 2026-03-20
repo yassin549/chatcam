@@ -15,10 +15,12 @@ const TELEGRAM_WEBHOOK_URL = process.env.TELEGRAM_WEBHOOK_URL || '';
 const TELEGRAM_WEBHOOK_PATH = process.env.TELEGRAM_WEBHOOK_PATH || '/telegram';
 const TELEGRAM_WEBHOOK_SECRET = process.env.TELEGRAM_WEBHOOK_SECRET || '';
 const TELEGRAM_WEBHOOK_ENABLED = Boolean(TELEGRAM_WEBHOOK_URL);
+const TELEGRAM_MODE = (process.env.TELEGRAM_MODE || 'auto').toLowerCase();
 const TELEGRAM_WEBHOOK_ROUTE = TELEGRAM_WEBHOOK_PATH.startsWith('/')
   ? TELEGRAM_WEBHOOK_PATH
   : `/${TELEGRAM_WEBHOOK_PATH}`;
 const TELEGRAM_DEBUG = (process.env.TELEGRAM_DEBUG || '').toLowerCase() === 'true';
+const TELEGRAM_DEBUG_UPDATES = (process.env.TELEGRAM_DEBUG_UPDATES || '').toLowerCase() === 'true';
 
 const HEALTH_PORT = parseInt(process.env.ANALYZER_PORT || process.env.PORT || '8090', 10);
 let webrtcBaseUrl = process.env.WEBRTC_URL || 'http://localhost:8080';
@@ -816,6 +818,9 @@ async function handleTelegramText(chatId, text, messageId) {
 
 async function handleTelegramUpdate(update) {
   if (!update) return;
+  if (TELEGRAM_DEBUG_UPDATES) {
+    console.log('Telegram update keys:', Object.keys(update));
+  }
   updateOffset = Math.max(updateOffset, (update.update_id || 0) + 1);
   const msg = update.message || update.edited_message || update.channel_post || update.edited_channel_post;
   if (!msg || !msg.chat) return;
@@ -889,6 +894,20 @@ async function startTelegramWebhook() {
 }
 
 function startTelegram() {
+  const mode = ['auto', 'polling', 'webhook'].includes(TELEGRAM_MODE) ? TELEGRAM_MODE : 'auto';
+  if (mode === 'polling') {
+    startTelegramPolling();
+    return;
+  }
+  if (mode === 'webhook') {
+    if (!TELEGRAM_WEBHOOK_ENABLED) {
+      console.warn('TELEGRAM_WEBHOOK_URL not set. Falling back to polling.');
+      startTelegramPolling();
+      return;
+    }
+    startTelegramWebhook().catch((err) => console.warn('Telegram webhook setup failed:', err));
+    return;
+  }
   if (TELEGRAM_WEBHOOK_ENABLED) {
     startTelegramWebhook().catch((err) => console.warn('Telegram webhook setup failed:', err));
     return;
@@ -1351,8 +1370,14 @@ http.createServer((req, res) => {
     return;
   }
 
-  if (TELEGRAM_WEBHOOK_ENABLED && pathname === TELEGRAM_WEBHOOK_ROUTE) {
+  const telegramRouteWithSlash = TELEGRAM_WEBHOOK_ROUTE.endsWith('/')
+    ? TELEGRAM_WEBHOOK_ROUTE
+    : `${TELEGRAM_WEBHOOK_ROUTE}/`;
+  if (TELEGRAM_WEBHOOK_ENABLED && (pathname === TELEGRAM_WEBHOOK_ROUTE || pathname === telegramRouteWithSlash)) {
     if (!isValidTelegramWebhookSecret(req)) {
+      if (TELEGRAM_DEBUG) {
+        console.warn('Telegram webhook unauthorized.');
+      }
       res.writeHead(401, { 'Content-Type': 'text/plain' });
       res.end('unauthorized');
       return;
