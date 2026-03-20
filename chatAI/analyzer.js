@@ -11,6 +11,13 @@ const TELEGRAM_POLL_MS = Math.max(1000, parseInt(process.env.TELEGRAM_POLL_MS ||
 const TELEGRAM_LONG_POLL_SECONDS = Math.max(0, parseInt(process.env.TELEGRAM_LONG_POLL_SECONDS || '25', 10));
 const TELEGRAM_FETCH_TIMEOUT_MS = Math.max(5000, parseInt(process.env.TELEGRAM_FETCH_TIMEOUT_MS || '35000', 10));
 const TELEGRAM_CLEAR_WEBHOOK = (process.env.TELEGRAM_CLEAR_WEBHOOK || 'true').toLowerCase() === 'true';
+const TELEGRAM_WEBHOOK_URL = process.env.TELEGRAM_WEBHOOK_URL || '';
+const TELEGRAM_WEBHOOK_PATH = process.env.TELEGRAM_WEBHOOK_PATH || '/telegram';
+const TELEGRAM_WEBHOOK_SECRET = process.env.TELEGRAM_WEBHOOK_SECRET || '';
+const TELEGRAM_WEBHOOK_ENABLED = Boolean(TELEGRAM_WEBHOOK_URL);
+const TELEGRAM_WEBHOOK_ROUTE = TELEGRAM_WEBHOOK_PATH.startsWith('/')
+  ? TELEGRAM_WEBHOOK_PATH
+  : `/${TELEGRAM_WEBHOOK_PATH}`;
 const TELEGRAM_DEBUG = (process.env.TELEGRAM_DEBUG || '').toLowerCase() === 'true';
 
 const HEALTH_PORT = parseInt(process.env.ANALYZER_PORT || process.env.PORT || '8090', 10);
@@ -285,6 +292,94 @@ async function clearTelegramWebhook() {
   } catch (err) {
     console.warn('Telegram deleteWebhook error:', err.message || err);
   }
+}
+
+function buildTelegramWebhookUrl() {
+  const base = TELEGRAM_WEBHOOK_URL.trim();
+  if (!base) return '';
+  let url;
+  try {
+    url = new URL(base);
+  } catch (err) {
+    throw new Error(`TELEGRAM_WEBHOOK_URL must be a valid URL (got "${base}").`);
+  }
+  if (url.protocol !== 'https:') {
+    throw new Error('TELEGRAM_WEBHOOK_URL must use https.');
+  }
+  if (url.pathname && url.pathname !== '/' && url.pathname !== TELEGRAM_WEBHOOK_ROUTE) {
+    console.warn('TELEGRAM_WEBHOOK_URL includes a path. Overriding with TELEGRAM_WEBHOOK_PATH.');
+  }
+  url.pathname = TELEGRAM_WEBHOOK_ROUTE;
+  url.search = '';
+  return url.toString();
+}
+
+async function setTelegramWebhook() {
+  if (!TELEGRAM_BOT_TOKEN) return;
+  let webhookUrl;
+  try {
+    webhookUrl = buildTelegramWebhookUrl();
+  } catch (err) {
+    console.error(err.message || err);
+    return;
+  }
+  if (!webhookUrl) {
+    console.warn('TELEGRAM_WEBHOOK_URL not set. Telegram webhook is disabled.');
+    return;
+  }
+  try {
+    const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook`;
+    const body = {
+      url: webhookUrl,
+      allowed_updates: ['message', 'edited_message', 'channel_post', 'edited_channel_post'],
+      drop_pending_updates: TELEGRAM_CLEAR_WEBHOOK
+    };
+    if (TELEGRAM_WEBHOOK_SECRET) {
+      body.secret_token = TELEGRAM_WEBHOOK_SECRET;
+    }
+    const res = await fetchTelegram(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+    if (!res.ok) {
+      const respBody = await res.text().catch(() => '');
+      console.warn('Telegram setWebhook failed:', res.status, respBody);
+      return;
+    }
+    if (TELEGRAM_DEBUG) {
+      console.log('Telegram webhook configured:', webhookUrl);
+    }
+  } catch (err) {
+    console.warn('Telegram setWebhook error:', err.message || err);
+  }
+}
+
+function isValidTelegramWebhookSecret(req) {
+  if (!TELEGRAM_WEBHOOK_SECRET) return true;
+  const token = req.headers['x-telegram-bot-api-secret-token'];
+  if (Array.isArray(token)) {
+    return token[0] === TELEGRAM_WEBHOOK_SECRET;
+  }
+  return token === TELEGRAM_WEBHOOK_SECRET;
+}
+
+function readRequestBody(req, limitBytes = 1_000_000) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0;
+    req.on('data', (chunk) => {
+      size += chunk.length;
+      if (size > limitBytes) {
+        reject(new Error('Payload too large'));
+        try { req.destroy(); } catch {}
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+    req.on('error', reject);
+  });
 }
 
 function isLlmConfigured() {
@@ -690,6 +785,17 @@ async function handleTelegramText(chatId, text, messageId) {
   }
 }
 
+async function handleTelegramUpdate(update) {
+  if (!update) return;
+  updateOffset = Math.max(updateOffset, (update.update_id || 0) + 1);
+  const msg = update.message || update.edited_message || update.channel_post || update.edited_channel_post;
+  if (!msg || !msg.chat) return;
+  const chatId = msg.chat.id;
+  const messageId = msg.message_id;
+  const text = typeof msg.text === 'string' ? msg.text : (typeof msg.caption === 'string' ? msg.caption : '');
+  await handleTelegramText(chatId, text, messageId);
+}
+
 async function pollTelegramUpdates() {
   if (!TELEGRAM_BOT_TOKEN || pollInFlight) return;
   pollInFlight = true;
@@ -716,13 +822,7 @@ async function pollTelegramUpdates() {
     }
 
     for (const update of data.result) {
-      updateOffset = Math.max(updateOffset, (update.update_id || 0) + 1);
-      const msg = update.message || update.edited_message || update.channel_post || update.edited_channel_post;
-      if (!msg || !msg.chat) continue;
-      const chatId = msg.chat.id;
-      if (typeof msg.text === 'string') {
-        await handleTelegramText(chatId, msg.text, msg.message_id);
-      }
+      await handleTelegramUpdate(update);
     }
   } catch (err) {
     const cause = err && err.cause ? err.cause : null;
@@ -748,6 +848,23 @@ function startTelegramPolling() {
     pollTelegramUpdates().catch((err) => console.warn('Telegram polling failed:', err));
   }, TELEGRAM_POLL_MS);
   pollTelegramUpdates().catch((err) => console.warn('Telegram polling failed:', err));
+}
+
+async function startTelegramWebhook() {
+  if (!TELEGRAM_BOT_TOKEN) {
+    console.warn('TELEGRAM_BOT_TOKEN is not set. Telegram bot is disabled.');
+    return;
+  }
+  await setTelegramWebhook();
+  console.log('Telegram webhook mode enabled.');
+}
+
+function startTelegram() {
+  if (TELEGRAM_WEBHOOK_ENABLED) {
+    startTelegramWebhook().catch((err) => console.warn('Telegram webhook setup failed:', err));
+    return;
+  }
+  startTelegramPolling();
 }
 
 function clampByte(value) {
@@ -832,7 +949,7 @@ async function generateCaption(image) {
 
 async function startAnalyzer() {
   await initDb();
-  startTelegramPolling();
+  startTelegram();
   if (!WEBRTC_MODEL_ON_CONNECT) {
     initModel().catch((err) => {
       console.error('Vision model failed to load:', err);
@@ -1027,11 +1144,49 @@ async function startAnalyzer() {
 }
 
 http.createServer((req, res) => {
-  if (req.url === '/health') {
+  const pathname = req.url ? req.url.split('?')[0] : '';
+
+  if (pathname === '/health') {
     res.writeHead(200, { 'Content-Type': 'text/plain' });
     res.end('ok');
     return;
   }
+
+  if (TELEGRAM_WEBHOOK_ENABLED && pathname === TELEGRAM_WEBHOOK_ROUTE) {
+    if (!isValidTelegramWebhookSecret(req)) {
+      res.writeHead(401, { 'Content-Type': 'text/plain' });
+      res.end('unauthorized');
+      return;
+    }
+
+    if (req.method === 'POST') {
+      readRequestBody(req)
+        .then((body) => {
+          res.writeHead(200, { 'Content-Type': 'text/plain' });
+          res.end('ok');
+          let update;
+          try {
+            update = JSON.parse(body || '{}');
+          } catch {
+            return;
+          }
+          handleTelegramUpdate(update).catch((err) => {
+            console.warn('Telegram webhook handler error:', err.message || err);
+          });
+        })
+        .catch((err) => {
+          const status = err && err.message === 'Payload too large' ? 413 : 400;
+          res.writeHead(status, { 'Content-Type': 'text/plain' });
+          res.end('invalid');
+        });
+      return;
+    }
+
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('ok');
+    return;
+  }
+
   res.writeHead(404);
   res.end('not found');
 }).listen(HEALTH_PORT, () => {

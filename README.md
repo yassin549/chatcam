@@ -117,6 +117,9 @@ npm run analyze
 - `JPEG_QUALITY` (default: `70`)
 - `MIN_EVENT_SECONDS` (default: `5`)
 - `ANALYZER_PORT` (health server port, default: `8090` when `PORT` is not set)
+- `TELEGRAM_WEBHOOK_URL` (enables webhook mode, must be full `https` base URL; path comes from `TELEGRAM_WEBHOOK_PATH`)
+- `TELEGRAM_WEBHOOK_PATH` (default: `/telegram`)
+- `TELEGRAM_WEBHOOK_SECRET` (optional secret token validation)
 
 ### Telegram
 - Send at least one message to the bot so `getUpdates` can resolve your chat id.
