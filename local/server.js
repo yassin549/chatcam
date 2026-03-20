@@ -7,6 +7,11 @@ const wrtc = require('wrtc');
 
 const PORT = parseInt(process.env.PORT || '8080', 10);
 const RTSP_URL = process.env.RTSP_URL || '';
+const ANALYZER_CONTROL_URL = process.env.ANALYZER_CONTROL_URL || '';
+const ANALYZER_CONTROL_TOKEN = process.env.ANALYZER_CONTROL_TOKEN || '';
+const ANALYZER_PING_MS = Math.max(5000, parseInt(process.env.ANALYZER_PING_MS || '15000', 10));
+const ANALYZER_PING_TIMEOUT_MS = Math.max(2000, parseInt(process.env.ANALYZER_PING_TIMEOUT_MS || '8000', 10));
+const PUBLIC_WEBRTC_URL = process.env.PUBLIC_WEBRTC_URL || '';
 
 if (!RTSP_URL) {
   console.error('RTSP_URL is required.');
@@ -20,6 +25,78 @@ const FRAME_SIZE = Math.floor(WIDTH * HEIGHT * 3 / 2); // yuv420p
 
 const videoSource = new wrtc.nonstandard.RTCVideoSource();
 const videoTrack = videoSource.createTrack();
+
+let analyzerPingTimer = null;
+let analyzerStopping = false;
+
+function buildAnalyzerControlUrl(pathname) {
+  if (!ANALYZER_CONTROL_URL) return '';
+  let url;
+  try {
+    url = new URL(ANALYZER_CONTROL_URL);
+  } catch {
+    console.warn('ANALYZER_CONTROL_URL is invalid.');
+    return '';
+  }
+  url.pathname = pathname;
+  url.search = '';
+  return url.toString();
+}
+
+async function sendAnalyzerControl(pathname, payload) {
+  if (!ANALYZER_CONTROL_URL) return;
+  const url = buildAnalyzerControlUrl(pathname);
+  if (!url) return;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), ANALYZER_PING_TIMEOUT_MS);
+  const headers = { 'Content-Type': 'application/json' };
+  if (ANALYZER_CONTROL_TOKEN) {
+    headers.Authorization = `Bearer ${ANALYZER_CONTROL_TOKEN}`;
+  }
+  try {
+    await fetch(url, {
+      method: 'POST',
+      headers,
+      body: payload ? JSON.stringify(payload) : undefined,
+      signal: controller.signal
+    });
+  } catch (err) {
+    if (err && err.name === 'AbortError') {
+      console.warn('Analyzer control request timed out.');
+    } else {
+      console.warn('Analyzer control request failed:', err.message || err);
+    }
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function getControlPayload() {
+  if (PUBLIC_WEBRTC_URL) {
+    return { webrtcUrl: PUBLIC_WEBRTC_URL };
+  }
+  return null;
+}
+
+function startAnalyzerHeartbeat() {
+  if (!ANALYZER_CONTROL_URL) return;
+  const payload = getControlPayload();
+  sendAnalyzerControl('/control/start', payload);
+  analyzerPingTimer = setInterval(() => {
+    sendAnalyzerControl('/control/ping', payload);
+  }, ANALYZER_PING_MS);
+}
+
+async function stopAnalyzerHeartbeat() {
+  if (analyzerStopping) return;
+  analyzerStopping = true;
+  if (analyzerPingTimer) {
+    clearInterval(analyzerPingTimer);
+    analyzerPingTimer = null;
+  }
+  const payload = getControlPayload();
+  await sendAnalyzerControl('/control/stop', payload);
+}
 
 function startFfmpeg() {
   const args = [
@@ -144,4 +221,18 @@ wss.on('connection', (ws) => {
 
 server.listen(PORT, () => {
   console.log(`Server running on http://localhost:${PORT}`);
+  startAnalyzerHeartbeat();
+});
+
+async function shutdown(signal) {
+  await stopAnalyzerHeartbeat();
+  process.exit(0);
+}
+
+process.on('SIGINT', () => {
+  shutdown('SIGINT').catch(() => process.exit(1));
+});
+
+process.on('SIGTERM', () => {
+  shutdown('SIGTERM').catch(() => process.exit(1));
 });

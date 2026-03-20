@@ -21,7 +21,11 @@ const TELEGRAM_WEBHOOK_ROUTE = TELEGRAM_WEBHOOK_PATH.startsWith('/')
 const TELEGRAM_DEBUG = (process.env.TELEGRAM_DEBUG || '').toLowerCase() === 'true';
 
 const HEALTH_PORT = parseInt(process.env.ANALYZER_PORT || process.env.PORT || '8090', 10);
-const WEBRTC_BASE_URL = process.env.WEBRTC_URL || 'http://localhost:8080';
+let webrtcBaseUrl = process.env.WEBRTC_URL || 'http://localhost:8080';
+const ANALYZER_CONTROL_ENABLED = (process.env.ANALYZER_CONTROL_ENABLED || 'false').toLowerCase() === 'true';
+const ANALYZER_CONTROL_TOKEN = process.env.ANALYZER_CONTROL_TOKEN || '';
+const ANALYZER_CONTROL_TTL_MS = Math.max(0, parseInt(process.env.ANALYZER_CONTROL_TTL_MS || '90000', 10));
+const ANALYZER_CONTROL_AUTO_START = (process.env.ANALYZER_CONTROL_AUTO_START || 'false').toLowerCase() === 'true';
 const WEBRTC_RECONNECT_MIN_MS = Math.max(1000, parseInt(process.env.WEBRTC_RECONNECT_MIN_MS || '2000', 10));
 const WEBRTC_RECONNECT_MAX_MS = Math.max(WEBRTC_RECONNECT_MIN_MS, parseInt(process.env.WEBRTC_RECONNECT_MAX_MS || '60000', 10));
 const WEBRTC_SUSPEND_AFTER_MS = Math.max(0, parseInt(process.env.WEBRTC_SUSPEND_AFTER_MS || '300000', 10));
@@ -92,6 +96,7 @@ let updateOffset = 0;
 let pollInFlight = false;
 let lastCaptionNorm = '';
 let lastEventAt = 0;
+let controlApi = null;
 
 const knownChatIds = new Set();
 const chatHistory = new Map();
@@ -147,6 +152,30 @@ function buildWebSocketUrl(baseUrl) {
   url.pathname = '/ws';
   url.search = '';
   return url.toString();
+}
+
+function getControlToken(req) {
+  const auth = req.headers.authorization || '';
+  if (auth.toLowerCase().startsWith('bearer ')) {
+    return auth.slice(7).trim();
+  }
+  const header = req.headers['x-analyzer-token'] || req.headers['x-chatcam-token'];
+  if (Array.isArray(header)) return header[0];
+  return header || '';
+}
+
+function isControlAuthorized(req) {
+  if (!ANALYZER_CONTROL_TOKEN) return true;
+  return getControlToken(req) === ANALYZER_CONTROL_TOKEN;
+}
+
+function safeParseBodyJson(body) {
+  if (!body) return null;
+  try {
+    return JSON.parse(body);
+  } catch {
+    return null;
+  }
 }
 
 function addChatHistory(chatId, role, content) {
@@ -958,19 +987,45 @@ async function startAnalyzer() {
 
   let wsUrl;
   try {
-    wsUrl = buildWebSocketUrl(WEBRTC_BASE_URL);
+    wsUrl = buildWebSocketUrl(webrtcBaseUrl);
   } catch (err) {
     console.error(err.message || err);
     process.exit(1);
   }
-  console.log('Connecting to WebRTC signaling:', wsUrl);
+  console.log('WebRTC signaling target:', wsUrl);
 
+  let desiredActive = !ANALYZER_CONTROL_ENABLED || ANALYZER_CONTROL_AUTO_START;
+  let lastControlAt = desiredActive ? Date.now() : 0;
+  let controlTimer = null;
   let lastFrameAt = 0;
   let processing = false;
   let reconnectDelay = WEBRTC_RECONNECT_MIN_MS;
   let offlineSince = null;
   let reconnectTimer = null;
   let suspendedLogged = false;
+  let connecting = false;
+  let activeWs = null;
+  let activePc = null;
+  let activeSink = null;
+
+  const cleanupConnection = () => {
+    const ws = activeWs;
+    const pc = activePc;
+    const sink = activeSink;
+    activeWs = null;
+    activePc = null;
+    activeSink = null;
+    connecting = false;
+    if (sink) {
+      try { sink.stop(); } catch {}
+    }
+    if (pc) {
+      try { pc.close(); } catch {}
+    }
+    if (ws) {
+      try { ws.close(); } catch {}
+    }
+  };
 
   const resetReconnect = () => {
     reconnectDelay = WEBRTC_RECONNECT_MIN_MS;
@@ -982,7 +1037,55 @@ async function startAnalyzer() {
     }
   };
 
+  const updateWebRtcUrl = (nextUrl, reason) => {
+    if (!nextUrl || typeof nextUrl !== 'string') return;
+    const trimmed = nextUrl.trim();
+    if (!trimmed || trimmed === webrtcBaseUrl) return;
+    let nextWs;
+    try {
+      nextWs = buildWebSocketUrl(trimmed);
+    } catch (err) {
+      console.warn('Ignoring invalid WEBRTC_URL from control:', err.message || err);
+      return;
+    }
+    webrtcBaseUrl = trimmed;
+    wsUrl = nextWs;
+    console.log(`WEBRTC_URL updated (${reason}): ${webrtcBaseUrl}`);
+    if (desiredActive) {
+      resetReconnect();
+      cleanupConnection();
+      connect();
+    }
+  };
+
+  const setDesiredActive = (next, reason) => {
+    if (next) {
+      lastControlAt = Date.now();
+    }
+    if (desiredActive === next) {
+      return;
+    }
+    desiredActive = next;
+    if (desiredActive) {
+      resetReconnect();
+      connect();
+      if (TELEGRAM_DEBUG) {
+        console.log(`Analyzer activated${reason ? ` (${reason})` : ''}.`);
+      }
+    } else {
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
+      cleanupConnection();
+      if (TELEGRAM_DEBUG) {
+        console.log(`Analyzer paused${reason ? ` (${reason})` : ''}.`);
+      }
+    }
+  };
+
   const scheduleReconnect = (reason) => {
+    if (!desiredActive) return;
     const now = Date.now();
     if (!offlineSince) offlineSince = now;
     const offlineFor = now - offlineSince;
@@ -1005,10 +1108,14 @@ async function startAnalyzer() {
   };
 
   const connect = () => {
+    if (!desiredActive || connecting) return;
+    connecting = true;
     const ws = new WebSocket(wsUrl);
     const pc = new wrtc.RTCPeerConnection({
       iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
     });
+    activeWs = ws;
+    activePc = pc;
 
     pc.addTransceiver('video', { direction: 'recvonly' });
 
@@ -1034,8 +1141,10 @@ async function startAnalyzer() {
     pc.ontrack = (event) => {
       const track = event.track;
       const sink = new wrtc.nonstandard.RTCVideoSink(track);
+      activeSink = sink;
 
       sink.onframe = async ({ frame }) => {
+        if (!desiredActive) return;
         const now = Date.now();
         const minInterval = 1000 / ANALYZE_FPS;
         if (processing || now - lastFrameAt < minInterval) return;
@@ -1079,10 +1188,16 @@ async function startAnalyzer() {
         }
       };
 
-      track.onended = () => sink.stop();
+      track.onended = () => {
+        if (activeSink === sink) {
+          activeSink = null;
+        }
+        sink.stop();
+      };
     };
 
     ws.on('message', async (message) => {
+      if (activeWs !== ws) return;
       let data;
       try {
         data = JSON.parse(message.toString());
@@ -1105,50 +1220,134 @@ async function startAnalyzer() {
     });
 
     ws.on('open', async () => {
+      if (activeWs !== ws || !desiredActive) {
+        cleanupConnection();
+        return;
+      }
+      connecting = false;
       resetReconnect();
       if (WEBRTC_MODEL_ON_CONNECT) {
         ensureModelLoaded().catch((err) => console.error('Vision model failed to load:', err));
       }
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-      ws.send(JSON.stringify({ type: 'offer', sdp: pc.localDescription.sdp }));
-      while (pendingCandidates.length > 0) {
-        ws.send(pendingCandidates.shift());
+      try {
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        ws.send(JSON.stringify({ type: 'offer', sdp: pc.localDescription.sdp }));
+        while (pendingCandidates.length > 0) {
+          ws.send(pendingCandidates.shift());
+        }
+      } catch (err) {
+        console.warn('WebRTC offer error:', err.message || err);
+        cleanupConnection();
+        scheduleReconnect('offer_error');
       }
     });
 
-    const cleanup = () => {
-      try { ws.close(); } catch {}
-      try { pc.close(); } catch {}
+    const handleDisconnect = (reason) => {
+      if (activeWs !== ws) return;
+      cleanupConnection();
+      scheduleReconnect(reason);
     };
 
-    ws.on('close', () => {
-      cleanup();
-      scheduleReconnect('close');
-    });
+    ws.on('close', () => handleDisconnect('close'));
 
     ws.on('error', (err) => {
       console.warn('WebSocket error:', err.message);
-      cleanup();
-      scheduleReconnect('error');
+      handleDisconnect('error');
     });
 
     ws.on('unexpected-response', (req, res) => {
       console.warn('WebSocket unexpected response:', res.statusCode);
-      cleanup();
-      scheduleReconnect(`http_${res.statusCode}`);
+      handleDisconnect(`http_${res.statusCode}`);
     });
   };
 
-  connect();
+  if (ANALYZER_CONTROL_ENABLED) {
+    controlApi = {
+      start: (payload) => {
+        const data = payload || {};
+        updateWebRtcUrl(data.webrtcUrl || data.webrtc_url, 'control_start');
+        setDesiredActive(true, 'control_start');
+      },
+      stop: (payload) => {
+        const data = payload || {};
+        updateWebRtcUrl(data.webrtcUrl || data.webrtc_url, 'control_stop');
+        setDesiredActive(false, 'control_stop');
+      },
+      ping: (payload) => {
+        const data = payload || {};
+        updateWebRtcUrl(data.webrtcUrl || data.webrtc_url, 'control_ping');
+        setDesiredActive(true, 'control_ping');
+      }
+    };
+
+    if (ANALYZER_CONTROL_TTL_MS > 0) {
+      const interval = Math.max(5000, Math.min(30000, Math.floor(ANALYZER_CONTROL_TTL_MS / 2)));
+      controlTimer = setInterval(() => {
+        if (!desiredActive) return;
+        if (Date.now() - lastControlAt > ANALYZER_CONTROL_TTL_MS) {
+          setDesiredActive(false, 'control_timeout');
+        }
+      }, interval);
+    }
+
+    if (!desiredActive) {
+      console.log('Analyzer control mode enabled; waiting for /control/start.');
+    }
+  }
+
+  if (desiredActive) {
+    connect();
+  }
 }
 
 http.createServer((req, res) => {
   const pathname = req.url ? req.url.split('?')[0] : '';
 
-  if (pathname === '/health') {
+  if (pathname === '/' || pathname === '/health') {
     res.writeHead(200, { 'Content-Type': 'text/plain' });
     res.end('ok');
+    return;
+  }
+
+  if (ANALYZER_CONTROL_ENABLED && pathname.startsWith('/control')) {
+    if (!isControlAuthorized(req)) {
+      res.writeHead(401, { 'Content-Type': 'text/plain' });
+      res.end('unauthorized');
+      return;
+    }
+    if (req.method !== 'POST') {
+      res.writeHead(405, { 'Content-Type': 'text/plain' });
+      res.end('method not allowed');
+      return;
+    }
+    readRequestBody(req)
+      .then((body) => {
+        const payload = safeParseBodyJson(body) || {};
+        if (!controlApi) {
+          res.writeHead(503, { 'Content-Type': 'text/plain' });
+          res.end('not ready');
+          return;
+        }
+        if (pathname === '/control/start') {
+          controlApi.start(payload);
+        } else if (pathname === '/control/stop') {
+          controlApi.stop(payload);
+        } else if (pathname === '/control/ping') {
+          controlApi.ping(payload);
+        } else {
+          res.writeHead(404, { 'Content-Type': 'text/plain' });
+          res.end('not found');
+          return;
+        }
+        res.writeHead(200, { 'Content-Type': 'text/plain' });
+        res.end('ok');
+      })
+      .catch((err) => {
+        const status = err && err.message === 'Payload too large' ? 413 : 400;
+        res.writeHead(status, { 'Content-Type': 'text/plain' });
+        res.end('invalid');
+      });
     return;
   }
 
