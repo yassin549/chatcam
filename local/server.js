@@ -12,6 +12,8 @@ const ANALYZER_CONTROL_URL = process.env.ANALYZER_CONTROL_URL || '';
 const ANALYZER_CONTROL_TOKEN = process.env.ANALYZER_CONTROL_TOKEN || '';
 const ANALYZER_PING_MS = Math.max(5000, parseInt(process.env.ANALYZER_PING_MS || '15000', 10));
 const ANALYZER_PING_TIMEOUT_MS = Math.max(2000, parseInt(process.env.ANALYZER_PING_TIMEOUT_MS || '8000', 10));
+const ANALYZER_PUBLIC_CHECK_MS = Math.max(5000, parseInt(process.env.ANALYZER_PUBLIC_CHECK_MS || '15000', 10));
+const ANALYZER_PUBLIC_CHECK_TIMEOUT_MS = Math.max(1000, parseInt(process.env.ANALYZER_PUBLIC_CHECK_TIMEOUT_MS || '4000', 10));
 const PUBLIC_WEBRTC_URL = process.env.PUBLIC_WEBRTC_URL || '';
 const ANALYZER_CONTROL_LOG = (process.env.ANALYZER_CONTROL_LOG || 'true').toLowerCase() === 'true';
 
@@ -34,7 +36,10 @@ const videoSource = new wrtc.nonstandard.RTCVideoSource();
 const videoTrack = videoSource.createTrack();
 
 let analyzerPingTimer = null;
-let analyzerStopping = false;
+let analyzerStopInFlight = false;
+let publicCheckTimer = null;
+let publicCheckInFlight = false;
+let lastPublicReachable = null;
 
 function buildAnalyzerControlUrl(pathname) {
   if (!ANALYZER_CONTROL_URL) return '';
@@ -98,6 +103,9 @@ function startAnalyzerHeartbeat() {
     console.warn('ANALYZER_CONTROL_URL not set; analyzer control is disabled.');
     return;
   }
+  if (analyzerPingTimer) {
+    return;
+  }
   const payload = getControlPayload();
   if (ANALYZER_CONTROL_LOG) {
     console.log('Sending analyzer /control/start', payload || {});
@@ -109,14 +117,100 @@ function startAnalyzerHeartbeat() {
 }
 
 async function stopAnalyzerHeartbeat() {
-  if (analyzerStopping) return;
-  analyzerStopping = true;
+  if (analyzerStopInFlight) return;
+  if (!analyzerPingTimer && lastPublicReachable === false) {
+    return;
+  }
+  analyzerStopInFlight = true;
   if (analyzerPingTimer) {
     clearInterval(analyzerPingTimer);
     analyzerPingTimer = null;
   }
   const payload = getControlPayload();
   await sendAnalyzerControl('/control/stop', payload);
+  analyzerStopInFlight = false;
+}
+
+function buildPublicCheckUrl() {
+  if (!PUBLIC_WEBRTC_URL) return '';
+  let url;
+  try {
+    url = new URL(PUBLIC_WEBRTC_URL);
+  } catch {
+    console.warn('PUBLIC_WEBRTC_URL is invalid.');
+    return '';
+  }
+  url.pathname = '/client.html';
+  url.search = '';
+  return url.toString();
+}
+
+async function isPublicWebrtcReachable() {
+  const checkUrl = buildPublicCheckUrl();
+  if (!checkUrl) return false;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), ANALYZER_PUBLIC_CHECK_TIMEOUT_MS);
+  try {
+    const res = await fetch(checkUrl, { method: 'GET', signal: controller.signal });
+    return res.ok;
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function updateAnalyzerForReachability() {
+  if (!ANALYZER_CONTROL_URL) return;
+  if (!PUBLIC_WEBRTC_URL) {
+    startAnalyzerHeartbeat();
+    return;
+  }
+  if (publicCheckInFlight) return;
+  publicCheckInFlight = true;
+  try {
+    const reachable = await isPublicWebrtcReachable();
+    const prev = lastPublicReachable;
+    lastPublicReachable = reachable;
+    if (prev === null) {
+      if (reachable) {
+        console.log('Public WebRTC URL reachable; starting analyzer.');
+        startAnalyzerHeartbeat();
+      } else {
+        console.warn('Public WebRTC URL unreachable; analyzer waiting for availability.');
+        await stopAnalyzerHeartbeat();
+      }
+      return;
+    }
+    if (reachable && !prev) {
+      console.log('Public WebRTC URL reachable; resuming analyzer.');
+      startAnalyzerHeartbeat();
+    } else if (!reachable && prev) {
+      console.warn('Public WebRTC URL unreachable; stopping analyzer.');
+      await stopAnalyzerHeartbeat();
+    }
+  } finally {
+    publicCheckInFlight = false;
+  }
+}
+
+function startAnalyzerControlSupervisor() {
+  if (!ANALYZER_CONTROL_URL) {
+    console.warn('ANALYZER_CONTROL_URL not set; analyzer control is disabled.');
+    return;
+  }
+  if (!PUBLIC_WEBRTC_URL) {
+    startAnalyzerHeartbeat();
+    return;
+  }
+  updateAnalyzerForReachability().catch((err) => {
+    console.warn('Public WebRTC check failed:', err.message || err);
+  });
+  publicCheckTimer = setInterval(() => {
+    updateAnalyzerForReachability().catch((err) => {
+      console.warn('Public WebRTC check failed:', err.message || err);
+    });
+  }, ANALYZER_PUBLIC_CHECK_MS);
 }
 
 function startFfmpeg() {
@@ -242,7 +336,7 @@ wss.on('connection', (ws) => {
 
 server.listen(PORT, () => {
   console.log(`Server running on http://localhost:${PORT}`);
-  startAnalyzerHeartbeat();
+  startAnalyzerControlSupervisor();
 });
 
 async function shutdown(signal) {

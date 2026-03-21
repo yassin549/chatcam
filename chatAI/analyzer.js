@@ -1026,6 +1026,11 @@ async function startAnalyzer() {
   let activeWs = null;
   let activePc = null;
   let activeSink = null;
+  let frameCount = 0;
+  let lastFrameLogAt = 0;
+  let lastFrameCount = 0;
+  let firstFrameLogged = false;
+  let modelNotReadyLogged = false;
 
   const cleanupConnection = () => {
     const ws = activeWs;
@@ -1129,6 +1134,7 @@ async function startAnalyzer() {
   const connect = () => {
     if (!desiredActive || connecting) return;
     connecting = true;
+    console.log('WebRTC connecting:', wsUrl);
     const ws = new WebSocket(wsUrl);
     const pc = new wrtc.RTCPeerConnection({
       iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
@@ -1138,8 +1144,13 @@ async function startAnalyzer() {
 
     pc.addTransceiver('video', { direction: 'recvonly' });
 
+    pc.oniceconnectionstatechange = () => {
+      console.log('WebRTC ICE state:', pc.iceConnectionState);
+    };
+
     pc.onconnectionstatechange = () => {
       const state = pc.connectionState;
+      console.log('WebRTC connection state:', state);
       if (state === 'failed' || state === 'disconnected' || state === 'closed') {
         try { ws.close(); } catch {}
       }
@@ -1159,17 +1170,38 @@ async function startAnalyzer() {
 
     pc.ontrack = (event) => {
       const track = event.track;
+      console.log('WebRTC track received:', track.kind);
       const sink = new wrtc.nonstandard.RTCVideoSink(track);
       activeSink = sink;
 
       sink.onframe = async ({ frame }) => {
         if (!desiredActive) return;
         const now = Date.now();
+        frameCount += 1;
+        if (!firstFrameLogged) {
+          console.log('First video frame received.');
+          firstFrameLogged = true;
+        }
+        if (now - lastFrameLogAt >= 5000) {
+          const windowSec = lastFrameLogAt ? Math.max(1, Math.round((now - lastFrameLogAt) / 1000)) : 0;
+          const delta = frameCount - lastFrameCount;
+          if (windowSec > 0) {
+            console.log(`Frames received: ${frameCount} (+${delta} in last ${windowSec}s)`);
+          } else {
+            console.log(`Frames received: ${frameCount}`);
+          }
+          lastFrameLogAt = now;
+          lastFrameCount = frameCount;
+        }
         const minInterval = 1000 / ANALYZE_FPS;
         if (processing || now - lastFrameAt < minInterval) return;
         if (!modelReady) {
           if (WEBRTC_MODEL_ON_CONNECT) {
             ensureModelLoaded().catch((err) => console.error('Vision model failed to load:', err));
+          }
+          if (!modelNotReadyLogged) {
+            console.log('Frames arriving but model is not ready yet.');
+            modelNotReadyLogged = true;
           }
           return;
         }
@@ -1208,6 +1240,7 @@ async function startAnalyzer() {
       };
 
       track.onended = () => {
+        console.log('WebRTC track ended.');
         if (activeSink === sink) {
           activeSink = null;
         }
@@ -1243,6 +1276,7 @@ async function startAnalyzer() {
         cleanupConnection();
         return;
       }
+      console.log('WebSocket open.');
       connecting = false;
       resetReconnect();
       if (WEBRTC_MODEL_ON_CONNECT) {
@@ -1264,6 +1298,7 @@ async function startAnalyzer() {
 
     const handleDisconnect = (reason) => {
       if (activeWs !== ws) return;
+      console.log('WebSocket disconnected:', reason);
       cleanupConnection();
       scheduleReconnect(reason);
     };
