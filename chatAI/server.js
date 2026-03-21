@@ -12,6 +12,12 @@ const ANALYZER_CONTROL_TOKEN = process.env.ANALYZER_CONTROL_TOKEN || '';
 const ANALYZER_PING_MS = Math.max(5000, parseInt(process.env.ANALYZER_PING_MS || '15000', 10));
 const ANALYZER_PING_TIMEOUT_MS = Math.max(2000, parseInt(process.env.ANALYZER_PING_TIMEOUT_MS || '8000', 10));
 const PUBLIC_WEBRTC_URL = process.env.PUBLIC_WEBRTC_URL || '';
+const ANALYZER_CONTROL_LOG = (process.env.ANALYZER_CONTROL_LOG || 'true').toLowerCase() === 'true';
+
+if (typeof fetch !== 'function') {
+  console.error('Global fetch is not available. Use Node 18+ or add a fetch polyfill.');
+  process.exit(1);
+}
 
 if (!RTSP_URL) {
   console.error('RTSP_URL is required.');
@@ -54,12 +60,20 @@ async function sendAnalyzerControl(pathname, payload) {
     headers.Authorization = `Bearer ${ANALYZER_CONTROL_TOKEN}`;
   }
   try {
-    await fetch(url, {
+    const res = await fetch(url, {
       method: 'POST',
       headers,
       body: payload ? JSON.stringify(payload) : undefined,
       signal: controller.signal
     });
+    if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      console.warn(`Analyzer control ${pathname} failed:`, res.status, body);
+      return;
+    }
+    if (ANALYZER_CONTROL_LOG) {
+      console.log(`Analyzer control ${pathname} ok (${res.status}).`);
+    }
   } catch (err) {
     if (err && err.name === 'AbortError') {
       console.warn('Analyzer control request timed out.');
@@ -79,8 +93,14 @@ function getControlPayload() {
 }
 
 function startAnalyzerHeartbeat() {
-  if (!ANALYZER_CONTROL_URL) return;
+  if (!ANALYZER_CONTROL_URL) {
+    console.warn('ANALYZER_CONTROL_URL not set; analyzer control is disabled.');
+    return;
+  }
   const payload = getControlPayload();
+  if (ANALYZER_CONTROL_LOG) {
+    console.log('Sending analyzer /control/start', payload || {});
+  }
   sendAnalyzerControl('/control/start', payload);
   analyzerPingTimer = setInterval(() => {
     sendAnalyzerControl('/control/ping', payload);
